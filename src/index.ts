@@ -2,27 +2,29 @@
  * GLM Image Summary Extension
  *
  * When using non-vision GLM models (glm-4.6, glm-4.7, glm-4.7-flash, glm-5), this
- * extension intercepts image reads and sends them to glm-4.6v for detailed
- * analysis using a subprocess with specialized prompts.
+ * extension intercepts image/video reads and sends them to glm-4.6v for detailed
+ * analysis.
  *
  * Usage:
  *   pi -e npm:pi-glm-image-summary --provider zai --model glm-4.7
- *
- * The extension will:
- * 1. Detect when a non-vision GLM model is being used
- * 2. Check if the file being read is an image
- * 3. Call pi subprocess with glm-4.6v to analyze the image
- * 4. Return the categorized analysis to the current model
  */
 
 import { spawn } from "node:child_process";
-import { resolve } from "node:path";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { BorderedLoader, createReadTool } from "@mariozechner/pi-coding-agent";
-import { extractTextFromPiOutput, isImageFile, needsVisionProxy, VISION_MODEL, VISION_PROVIDER } from "./utils.js";
+import {
+	extractTextFromPiOutput,
+	isImageFile,
+	isVideoFile,
+	needsVisionProxy,
+	VISION_MODEL,
+	VISION_PROVIDER,
+} from "./utils.js";
 
 // Embedded skill prompt for GLM-4.6v
-const ANALYSIS_PROMPT = `You are analyzing an image. Follow these steps:
+const IMAGE_ANALYSIS_PROMPT = `You are analyzing an image. Follow these steps:
 
 ## Step 1: Classify
 
@@ -93,15 +95,33 @@ Always start your response with:
 
 Then provide your detailed analysis using the appropriate template above.`;
 
+const VIDEO_ANALYSIS_PROMPT = `You are analyzing a video represented as chronological keyframes.
+
+Output exactly:
+- **Category**: [one of: ui-demo, code-demo, error-demo, screencast, general-video]
+- A short timeline summary (3-6 bullets).
+- Any visible text/errors worth noting.`;
+
 interface AnalyzeImageOptions {
 	absolutePath: string;
 	signal?: AbortSignal;
 }
 
-async function analyzeImage({ absolutePath, signal }: AnalyzeImageOptions): Promise<string> {
+interface AnalyzeVideoOptions {
+	absolutePath: string;
+	signal?: AbortSignal;
+}
+
+interface AnalyzeWithPiOptions {
+	attachmentPaths: string[];
+	prompt: string;
+	signal?: AbortSignal;
+}
+
+async function analyzeWithPi({ attachmentPaths, prompt, signal }: AnalyzeWithPiOptions): Promise<string> {
 	return new Promise((resolvePromise, reject) => {
 		const args = [
-			`@${absolutePath}`,
+			...attachmentPaths.map((path) => `@${path}`),
 			"--provider",
 			VISION_PROVIDER,
 			"--model",
@@ -110,7 +130,7 @@ async function analyzeImage({ absolutePath, signal }: AnalyzeImageOptions): Prom
 			"--json",
 			"--no-extensions",
 			"-p",
-			ANALYSIS_PROMPT,
+			prompt,
 		];
 
 		const child = spawn("pi", args, {
@@ -154,36 +174,187 @@ async function analyzeImage({ absolutePath, signal }: AnalyzeImageOptions): Prom
 	});
 }
 
+async function analyzeImage({ absolutePath, signal }: AnalyzeImageOptions): Promise<string> {
+	return analyzeWithPi({
+		attachmentPaths: [absolutePath],
+		prompt: IMAGE_ANALYSIS_PROMPT,
+		signal,
+	});
+}
+
+async function getVideoDurationSeconds(absolutePath: string, signal?: AbortSignal): Promise<number | null> {
+	return new Promise((resolvePromise, reject) => {
+		const args = [
+			"-v",
+			"error",
+			"-show_entries",
+			"format=duration",
+			"-of",
+			"default=nokey=1:noprint_wrappers=1",
+			absolutePath,
+		];
+
+		const child = spawn("ffprobe", args, {
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+
+		let stdout = "";
+		let stderr = "";
+
+		child.stdout.on("data", (data: Buffer) => {
+			stdout += data.toString();
+		});
+
+		child.stderr.on("data", (data: Buffer) => {
+			stderr += data.toString();
+		});
+
+		child.on("error", (err: Error) => reject(err));
+
+		child.on("close", (code: number | null) => {
+			if (code !== 0) {
+				reject(new Error(`ffprobe failed (${code}): ${stderr}`));
+				return;
+			}
+			const duration = Number.parseFloat(stdout.trim());
+			resolvePromise(Number.isFinite(duration) && duration > 0 ? duration : null);
+		});
+
+		if (signal) {
+			const onAbort = () => {
+				child.kill();
+				reject(new Error("Operation aborted"));
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			child.on("close", () => signal.removeEventListener("abort", onAbort));
+		}
+	});
+}
+
+async function extractVideoFrames(absolutePath: string, framesDir: string, signal?: AbortSignal): Promise<string[]> {
+	const duration = await getVideoDurationSeconds(absolutePath, signal);
+	const interval = duration ? Math.max(duration / 3, 0.75) : 2;
+	const fpsFilter = `fps=1/${interval.toFixed(2)}`;
+	const outputPattern = join(framesDir, "frame_%03d.jpg");
+
+	await new Promise<void>((resolvePromise, reject) => {
+		const args = [
+			"-hide_banner",
+			"-loglevel",
+			"error",
+			"-i",
+			absolutePath,
+			"-vf",
+			fpsFilter,
+			"-frames:v",
+			"3",
+			outputPattern,
+		];
+
+		const child = spawn("ffmpeg", args, {
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+
+		let stderr = "";
+		child.stderr.on("data", (data: Buffer) => {
+			stderr += data.toString();
+		});
+
+		child.on("error", (err: Error) => reject(err));
+		child.on("close", (code: number | null) => {
+			if (code !== 0) {
+				reject(new Error(`ffmpeg failed (${code}): ${stderr}`));
+			} else {
+				resolvePromise();
+			}
+		});
+
+		if (signal) {
+			const onAbort = () => {
+				child.kill();
+				reject(new Error("Operation aborted"));
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			child.on("close", () => signal.removeEventListener("abort", onAbort));
+		}
+	});
+
+	const files = await readdir(framesDir);
+	return files
+		.filter((name) => name.toLowerCase().endsWith(".jpg"))
+		.sort((a, b) => a.localeCompare(b))
+		.map((name) => join(framesDir, name));
+}
+
+async function analyzeVideo({ absolutePath, signal }: AnalyzeVideoOptions): Promise<string> {
+	const framesDir = await mkdtemp(join(process.cwd(), ".glm-vision-frames-"));
+	let succeeded = false;
+
+	try {
+		const frames = await extractVideoFrames(absolutePath, framesDir, signal);
+		if (frames.length === 0) {
+			throw new Error("No frames could be extracted from video");
+		}
+
+		const analysis = await analyzeWithPi({
+			attachmentPaths: frames,
+			prompt: VIDEO_ANALYSIS_PROMPT,
+			signal,
+		});
+		succeeded = true;
+		return analysis;
+	} finally {
+		if (succeeded) {
+			await rm(framesDir, { recursive: true, force: true });
+		} else {
+			setTimeout(() => {
+				void rm(framesDir, { recursive: true, force: true });
+			}, 30_000);
+		}
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	const localRead = createReadTool(process.cwd());
 
-	// Override the read tool to intercept image reads for non-vision models
+	// Override read to intercept image/video reads for non-vision models
 	pi.registerTool({
 		...localRead,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const { path } = params;
 			const absolutePath = resolve(ctx.cwd, path);
+			const image = isImageFile(absolutePath);
+			const video = isVideoFile(absolutePath);
 
-			// Check if we need to proxy through vision model
-			if (!needsVisionProxy(ctx.model?.id) || !isImageFile(absolutePath)) {
+			if (!needsVisionProxy(ctx.model?.id) || (!image && !video)) {
 				return localRead.execute(toolCallId, params, signal, onUpdate);
 			}
 
-			// Analyze image with vision model
+			const mediaType = video ? "video" : "image";
 			onUpdate?.({
-				content: [{ type: "text", text: `[Analyzing image with ${VISION_MODEL}...]` }],
+				content: [
+					{
+						type: "text",
+						text: video
+							? `[Extracting keyframes and analyzing video with ${VISION_MODEL}...]`
+							: `[Analyzing image with ${VISION_MODEL}...]`,
+					},
+				],
 				details: {},
 			});
 
 			try {
-				const summaryText = await analyzeImage({ absolutePath, signal });
+				const summaryText = video
+					? await analyzeVideo({ absolutePath })
+					: await analyzeImage({ absolutePath });
 
 				if (signal?.aborted) {
 					throw new Error("Operation aborted");
 				}
 
+				const label = video ? "Video" : "Image";
 				const result = {
-					content: [{ type: "text" as const, text: `[Image analyzed with ${VISION_MODEL}]\n\n${summaryText}` }],
+					content: [{ type: "text" as const, text: `[${label} analyzed with ${VISION_MODEL}]\n\n${summaryText}` }],
 					details: {},
 				};
 
@@ -191,7 +362,7 @@ export default function (pi: ExtensionAPI) {
 				return result;
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				throw new Error(`Image analysis failed: ${message}`);
+				throw new Error(`${mediaType[0].toUpperCase()}${mediaType.slice(1)} analysis failed: ${message}`);
 			}
 		},
 	});
@@ -238,6 +409,50 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			await ctx.ui.editor("Image Analysis", result);
+		},
+	});
+
+	// Command for manual video analysis
+	pi.registerCommand("analyze-video", {
+		description: `Analyze a video file using ${VISION_MODEL}`,
+		handler: async (args, ctx) => {
+			if (!ctx.hasUI) {
+				ctx.ui.notify("analyze-video requires interactive mode", "error");
+				return;
+			}
+
+			const videoPath = args.trim();
+			if (!videoPath) {
+				ctx.ui.notify("Usage: /analyze-video <path-to-video>", "error");
+				return;
+			}
+
+			const absolutePath = resolve(ctx.cwd, videoPath);
+			if (!isVideoFile(absolutePath)) {
+				ctx.ui.notify("Not a supported video file", "error");
+				return;
+			}
+
+			const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+				const loader = new BorderedLoader(tui, theme, `Analyzing ${videoPath}...`);
+				loader.onAbort = () => done(null);
+
+				analyzeVideo({ absolutePath, signal: loader.signal })
+					.then((text) => done(text))
+					.catch((err) => {
+						ctx.ui.notify(`Analysis failed: ${err.message}`, "error");
+						done(null);
+					});
+
+				return loader;
+			});
+
+			if (result === null) {
+				ctx.ui.notify("Cancelled", "info");
+				return;
+			}
+
+			await ctx.ui.editor("Video Analysis", result);
 		},
 	});
 }

@@ -1,26 +1,27 @@
 # glm-vision
 
-A [pi](https://github.com/badlogic/pi-mono) extension that intercepts image reads when using non-vision GLM models and sends them to GLM-4.6v for detailed, categorized analysis.
+A [pi](https://github.com/badlogic/pi-mono) extension that intercepts image/video reads when using non-vision GLM models and sends them to GLM-4.6v for detailed analysis.
 
 ## Why?
 
-GLM text models (glm-4.6, glm-4.7, glm-4.7-flash, glm-5) have no vision capabilities. GLM-4.6v does. This extension automatically detects when you're using a non-vision GLM model and intercepts image reads, sending them to GLM-4.6v with a structured prompt that:
+GLM text models (glm-4.6, glm-4.7, glm-4.7-flash, glm-5) have no vision capabilities. GLM-4.6v does. This extension automatically detects when you're using a non-vision GLM model and intercepts image/video reads:
 
-1. **Classifies** the image (UI, code, error, diagram, chart, or general)
-2. **Applies specialized analysis** based on the category
+1. **Images** are sent directly to GLM-4.6v with a structured classification prompt.
+2. **Videos** are sampled into keyframes locally (via `ffmpeg`), then analyzed by GLM-4.6v in chronological order.
 
 This approach is [48% faster and produces higher quality output](./test-fixtures/README.md#performance-comparison-generic-vs-structured-prompt) compared to a generic "analyze this image" prompt.
 
 ## Features
 
-- **Automatic image interception**: When using glm-4.6, glm-4.7, glm-4.7-flash, or glm-5, image file reads are automatically redirected to glm-4.6v
-- **Smart classification**: Images are categorized (UI, code, error, diagram, chart, general) for targeted analysis
-- **Specialized prompts**: Each category gets analysis tailored to its content type:
+- **Automatic media interception**: When using glm-4.6, glm-4.7, glm-4.7-flash, or glm-5, supported image/video file reads are automatically redirected to glm-4.6v
+- **Image classification**: Images are categorized (UI, code, error, diagram, chart, general) for targeted analysis
+- **Video support for local files**: Videos are converted to chronological keyframes via `ffmpeg`, then summarized by GLM-4.6v
+- **Specialized prompts**:
   - **Code screenshots**: Extracts actual code with line numbers
   - **Error screenshots**: Provides root cause analysis and fix suggestions
   - **Diagrams**: Lists components, relationships, and protocols
   - **Charts**: Extracts data values, trends, and insights
-- **Manual analysis command**: `/analyze-image <path>` to manually analyze any image
+- **Manual analysis commands**: `/analyze-image <path>` and `/analyze-video <path>`
 
 ## Installation
 
@@ -54,24 +55,31 @@ pi --provider zai --model glm-4.7
 
 When the extension detects:
 1. Current model is `glm-4.6`, `glm-4.7`, `glm-4.7-flash`, or `glm-5`
-2. A file being read is an image (jpg, jpeg, png, gif, webp)
+2. A file being read is a supported image/video format
 
-It will automatically spawn a subprocess with glm-4.6v to analyze the image and return a categorized analysis.
+It will automatically spawn a subprocess with glm-4.6v to analyze the media and return a structured summary.
 
 ### Manual Analysis
 
-Use the `/analyze-image` command to analyze any image:
+Use the manual commands:
 
 ```
 /analyze-image ./screenshot.png
+/analyze-video ./recording.mp4
 ```
 
-## Supported Image Formats
+## Supported Formats
 
+### Images
 - JPEG (.jpg, .jpeg)
 - PNG (.png)
 - GIF (.gif)
 - WebP (.webp)
+
+### Videos
+- MP4 (.mp4)
+- Matroska (.mkv)
+- QuickTime (.mov)
 
 ## Development
 
@@ -103,6 +111,8 @@ The extension uses the ZAI provider for the vision model. Make sure you have pro
 ```bash
 export ZAI_API_KEY="your-api-key"
 ```
+
+Video analysis also requires `ffmpeg`/`ffprobe` to be available in your PATH.
 
 ## License
 

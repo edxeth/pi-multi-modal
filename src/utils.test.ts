@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
 	extractTextFromPiOutput,
 	isImageFile,
+	isVideoFile,
 	NON_VISION_MODELS,
 	needsVisionProxy,
 	SUPPORTED_IMAGE_EXTENSIONS,
+	SUPPORTED_VIDEO_EXTENSIONS,
 } from "./utils.js";
 
 describe("isImageFile", () => {
@@ -56,6 +58,33 @@ describe("isImageFile", () => {
 	it("covers all documented supported extensions", () => {
 		const expected = ["jpg", "jpeg", "png", "gif", "webp"];
 		expect(SUPPORTED_IMAGE_EXTENSIONS).toEqual(expected);
+	});
+});
+
+describe("isVideoFile", () => {
+	it("returns true for supported video extensions", () => {
+		const testCases = ["clip.mp4", "movie.mkv", "recording.mov"];
+		for (const path of testCases) {
+			expect(isVideoFile(path), `Expected ${path} to be recognized as video`).toBe(true);
+		}
+	});
+
+	it("returns true for uppercase extensions", () => {
+		expect(isVideoFile("clip.MP4")).toBe(true);
+		expect(isVideoFile("movie.MKV")).toBe(true);
+		expect(isVideoFile("recording.MOV")).toBe(true);
+	});
+
+	it("returns false for non-video extensions", () => {
+		const testCases = ["image.png", "doc.pdf", "sound.mp3", "archive.zip"];
+		for (const path of testCases) {
+			expect(isVideoFile(path), `Expected ${path} to NOT be recognized as video`).toBe(false);
+		}
+	});
+
+	it("covers all documented supported video extensions", () => {
+		const expected = ["mp4", "mkv", "mov"];
+		expect(SUPPORTED_VIDEO_EXTENSIONS).toEqual(expected);
 	});
 });
 
