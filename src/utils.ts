@@ -6,7 +6,7 @@
 // Configuration
 export const VISION_PROVIDER = "zai";
 export const VISION_MODEL = "glm-4.6v";
-export const NON_VISION_MODELS = ["glm-4.6", "glm-4.7", "glm-4.7-flash"];
+export const NON_VISION_MODELS = ["glm-4.6", "glm-4.7", "glm-4.7-flash", "glm-5"];
 export const SUPPORTED_IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp"];
 
 // Types for pi JSON output

@@ -64,6 +64,7 @@ describe("needsVisionProxy", () => {
 		expect(needsVisionProxy("glm-4.6")).toBe(true);
 		expect(needsVisionProxy("glm-4.7")).toBe(true);
 		expect(needsVisionProxy("glm-4.7-flash")).toBe(true);
+		expect(needsVisionProxy("glm-5")).toBe(true);
 	});
 
 	it("returns false for vision models", () => {
@@ -82,7 +83,7 @@ describe("needsVisionProxy", () => {
 	});
 
 	it("covers all documented non-vision models", () => {
-		const expected = ["glm-4.6", "glm-4.7", "glm-4.7-flash"];
+		const expected = ["glm-4.6", "glm-4.7", "glm-4.7-flash", "glm-5"];
 		expect(NON_VISION_MODELS).toEqual(expected);
 	});
 });

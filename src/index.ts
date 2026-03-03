@@ -1,7 +1,7 @@
 /**
  * GLM Image Summary Extension
  *
- * When using non-vision GLM models (glm-4.6, glm-4.7, glm-4.7-flash), this
+ * When using non-vision GLM models (glm-4.6, glm-4.7, glm-4.7-flash, glm-5), this
  * extension intercepts image reads and sends them to glm-4.6v for detailed
  * analysis using a subprocess with specialized prompts.
  *

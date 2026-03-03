@@ -4,7 +4,7 @@ A [pi](https://github.com/badlogic/pi-mono) extension that intercepts image read
 
 ## Why?
 
-GLM text models (glm-4.6, glm-4.7, glm-4.7-flash) have no vision capabilities. GLM-4.6v does. This extension automatically detects when you're using a non-vision GLM model and intercepts image reads, sending them to GLM-4.6v with a structured prompt that:
+GLM text models (glm-4.6, glm-4.7, glm-4.7-flash, glm-5) have no vision capabilities. GLM-4.6v does. This extension automatically detects when you're using a non-vision GLM model and intercepts image reads, sending them to GLM-4.6v with a structured prompt that:
 
 1. **Classifies** the image (UI, code, error, diagram, chart, or general)
 2. **Applies specialized analysis** based on the category
@@ -13,7 +13,7 @@ This approach is [48% faster and produces higher quality output](./test-fixtures
 
 ## Features
 
-- **Automatic image interception**: When using glm-4.7/glm-4.7-long, image file reads are automatically redirected to glm-4.6v
+- **Automatic image interception**: When using glm-4.6, glm-4.7, glm-4.7-flash, or glm-5, image file reads are automatically redirected to glm-4.6v
 - **Smart classification**: Images are categorized (UI, code, error, diagram, chart, general) for targeted analysis
 - **Specialized prompts**: Each category gets analysis tailored to its content type:
   - **Code screenshots**: Extracts actual code with line numbers
@@ -53,7 +53,7 @@ pi --provider zai --model glm-4.7
 ### Automatic Mode
 
 When the extension detects:
-1. Current model is `glm-4.6`, `glm-4.7`, or `glm-4.7-flash`
+1. Current model is `glm-4.6`, `glm-4.7`, `glm-4.7-flash`, or `glm-5`
 2. A file being read is an image (jpg, jpeg, png, gif, webp)
 
 It will automatically spawn a subprocess with glm-4.6v to analyze the image and return a categorized analysis.
