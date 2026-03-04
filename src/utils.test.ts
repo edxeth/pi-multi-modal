@@ -3,7 +3,6 @@ import {
 	extractTextFromPiOutput,
 	isImageFile,
 	isVideoFile,
-	NON_VISION_MODELS,
 	needsVisionProxy,
 	SUPPORTED_IMAGE_EXTENSIONS,
 	SUPPORTED_VIDEO_EXTENSIONS,
@@ -89,31 +88,17 @@ describe("isVideoFile", () => {
 });
 
 describe("needsVisionProxy", () => {
-	it("returns true for non-vision GLM models", () => {
-		expect(needsVisionProxy("glm-4.6")).toBe(true);
-		expect(needsVisionProxy("glm-4.7")).toBe(true);
-		expect(needsVisionProxy("glm-4.7-flash")).toBe(true);
-		expect(needsVisionProxy("glm-5")).toBe(true);
+	it("returns true for text-only models", () => {
+		expect(needsVisionProxy(["text"])).toBe(true);
 	});
 
-	it("returns false for vision models", () => {
-		expect(needsVisionProxy("glm-4.6v")).toBe(false);
-		expect(needsVisionProxy("glm-4.5v")).toBe(false);
+	it("returns false for image-capable models", () => {
+		expect(needsVisionProxy(["text", "image"])).toBe(false);
+		expect(needsVisionProxy(["image", "text"])).toBe(false);
 	});
 
-	it("returns false for non-GLM models", () => {
-		expect(needsVisionProxy("claude-sonnet-4-20250514")).toBe(false);
-		expect(needsVisionProxy("gpt-4o")).toBe(false);
-		expect(needsVisionProxy("gemini-2.5-flash")).toBe(false);
-	});
-
-	it("returns false for undefined model", () => {
+	it("returns false for undefined model input", () => {
 		expect(needsVisionProxy(undefined)).toBe(false);
-	});
-
-	it("covers all documented non-vision models", () => {
-		const expected = ["glm-4.6", "glm-4.7", "glm-4.7-flash", "glm-5"];
-		expect(NON_VISION_MODELS).toEqual(expected);
 	});
 });
 

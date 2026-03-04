@@ -438,7 +438,7 @@ export default function (pi: ExtensionAPI) {
 			const video = isVideoFile(absolutePath);
 			const pdf = isPdfFile(absolutePath);
 
-			if (!needsVisionProxy(ctx.model?.id) || (!image && !video && !pdf)) {
+			if (!needsVisionProxy(ctx.model?.input) || (!image && !video && !pdf)) {
 				return localRead.execute(toolCallId, params, signal, onUpdate);
 			}
 

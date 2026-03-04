@@ -6,7 +6,6 @@
 // Configuration
 export const VISION_PROVIDER = "zai";
 export const VISION_MODEL = "glm-4.6v";
-export const NON_VISION_MODELS = ["glm-4.6", "glm-4.7", "glm-4.7-flash", "glm-5"];
 export const SUPPORTED_IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp"];
 export const SUPPORTED_VIDEO_EXTENSIONS = ["mp4", "mkv", "mov"];
 export const SUPPORTED_PDF_EXTENSIONS = ["pdf"];
@@ -51,10 +50,11 @@ export function isPdfFile(path: string): boolean {
 }
 
 /**
- * Check if a model ID is a non-vision GLM model that needs vision proxy
+ * Check if a model needs vision proxy based on capability.
+ * Models with input=["text"] (no "image") need proxy for media reads.
  */
-export function needsVisionProxy(modelId: string | undefined): boolean {
-	return modelId !== undefined && NON_VISION_MODELS.includes(modelId);
+export function needsVisionProxy(inputTypes: ("text" | "image")[] | undefined): boolean {
+	return inputTypes !== undefined && !inputTypes.includes("image");
 }
 
 /**
