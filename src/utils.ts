@@ -9,6 +9,7 @@ export const VISION_MODEL = "glm-4.6v";
 export const NON_VISION_MODELS = ["glm-4.6", "glm-4.7", "glm-4.7-flash", "glm-5"];
 export const SUPPORTED_IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp"];
 export const SUPPORTED_VIDEO_EXTENSIONS = ["mp4", "mkv", "mov"];
+export const SUPPORTED_PDF_EXTENSIONS = ["pdf"];
 
 // Types for pi JSON output
 export interface PiMessage {
@@ -39,6 +40,14 @@ export function isImageFile(path: string): boolean {
 export function isVideoFile(path: string): boolean {
 	const ext = path.split(".").pop()?.toLowerCase();
 	return ext !== undefined && SUPPORTED_VIDEO_EXTENSIONS.includes(ext);
+}
+
+/**
+ * Check if a file path points to a supported PDF file
+ */
+export function isPdfFile(path: string): boolean {
+	const ext = path.split(".").pop()?.toLowerCase();
+	return ext !== undefined && SUPPORTED_PDF_EXTENSIONS.includes(ext);
 }
 
 /**

@@ -17,6 +17,7 @@ import { BorderedLoader, createReadTool } from "@mariozechner/pi-coding-agent";
 import {
 	extractTextFromPiOutput,
 	isImageFile,
+	isPdfFile,
 	isVideoFile,
 	needsVisionProxy,
 	VISION_MODEL,
@@ -102,12 +103,44 @@ Output exactly:
 - A short timeline summary (3-6 bullets).
 - Any visible text/errors worth noting.`;
 
+const PDF_ANALYSIS_PROMPT = `You are analyzing a PDF document. Follow these steps:
+
+## Step 1: Document Overview
+
+First, identify the document type and structure:
+- **Document Type**: [one of: report, paper, manual, form, presentation, contract, other]
+- **Page Count**: Number of pages
+- **Title**: Document title if present
+
+## Step 2: Content Analysis
+
+Extract and summarize the key content:
+- Main topics/sections covered
+- Key findings or conclusions
+- Important data, tables, or figures
+- Any actionable items or recommendations
+
+## Output Format
+
+Always start your response with:
+
+**Document Type**: [type]
+**Title**: [title or "Not found"]
+**Pages**: [count]
+
+Then provide your detailed analysis.`;
+
 interface AnalyzeImageOptions {
 	absolutePath: string;
 	signal?: AbortSignal;
 }
 
 interface AnalyzeVideoOptions {
+	absolutePath: string;
+	signal?: AbortSignal;
+}
+
+interface AnalyzePdfOptions {
 	absolutePath: string;
 	signal?: AbortSignal;
 }
@@ -180,6 +213,84 @@ async function analyzeImage({ absolutePath, signal }: AnalyzeImageOptions): Prom
 		prompt: IMAGE_ANALYSIS_PROMPT,
 		signal,
 	});
+}
+
+async function extractPdfPages(absolutePath: string, pagesDir: string, signal?: AbortSignal): Promise<string[]> {
+	const outputPattern = join(pagesDir, "page_%03d.png");
+
+	await new Promise<void>((resolvePromise, reject) => {
+		const args = [
+			"-dNOPAUSE",
+			"-dBATCH",
+			"-sDEVICE=png16m",
+			"-r144",
+			"-dFirstPage=1",
+			"-dLastPage=6",
+			`-sOutputFile=${outputPattern}`,
+			absolutePath,
+		];
+
+		const child = spawn("gs", args, {
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+
+		let stderr = "";
+		child.stderr.on("data", (data: Buffer) => {
+			stderr += data.toString();
+		});
+
+		child.on("error", (err: Error) => reject(err));
+		child.on("close", (code: number | null) => {
+			if (code !== 0) {
+				reject(new Error(`gs failed (${code}): ${stderr}`));
+			} else {
+				resolvePromise();
+			}
+		});
+
+		if (signal) {
+			const onAbort = () => {
+				child.kill();
+				reject(new Error("Operation aborted"));
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			child.on("close", () => signal.removeEventListener("abort", onAbort));
+		}
+	});
+
+	const files = await readdir(pagesDir);
+	return files
+		.filter((name) => name.toLowerCase().endsWith(".png"))
+		.sort((a, b) => a.localeCompare(b))
+		.map((name) => join(pagesDir, name));
+}
+
+async function analyzePdf({ absolutePath, signal }: AnalyzePdfOptions): Promise<string> {
+	const pagesDir = await mkdtemp(join(process.cwd(), ".glm-vision-pdf-"));
+	let succeeded = false;
+
+	try {
+		const pages = await extractPdfPages(absolutePath, pagesDir, signal);
+		if (pages.length === 0) {
+			throw new Error("No pages could be extracted from PDF");
+		}
+
+		const analysis = await analyzeWithPi({
+			attachmentPaths: pages,
+			prompt: `${PDF_ANALYSIS_PROMPT}\n\nThe attached images are rendered pages from a PDF in order.`,
+			signal,
+		});
+		succeeded = true;
+		return analysis;
+	} finally {
+		if (succeeded) {
+			await rm(pagesDir, { recursive: true, force: true });
+		} else {
+			setTimeout(() => {
+				void rm(pagesDir, { recursive: true, force: true });
+			}, 30_000);
+		}
+	}
 }
 
 async function getVideoDurationSeconds(absolutePath: string, signal?: AbortSignal): Promise<number | null> {
@@ -317,7 +428,7 @@ async function analyzeVideo({ absolutePath, signal }: AnalyzeVideoOptions): Prom
 export default function (pi: ExtensionAPI) {
 	const localRead = createReadTool(process.cwd());
 
-	// Override read to intercept image/video reads for non-vision models
+	// Override read to intercept image/video/PDF reads for non-vision models
 	pi.registerTool({
 		...localRead,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -325,19 +436,22 @@ export default function (pi: ExtensionAPI) {
 			const absolutePath = resolve(ctx.cwd, path);
 			const image = isImageFile(absolutePath);
 			const video = isVideoFile(absolutePath);
+			const pdf = isPdfFile(absolutePath);
 
-			if (!needsVisionProxy(ctx.model?.id) || (!image && !video)) {
+			if (!needsVisionProxy(ctx.model?.id) || (!image && !video && !pdf)) {
 				return localRead.execute(toolCallId, params, signal, onUpdate);
 			}
 
-			const mediaType = video ? "video" : "image";
+			const mediaType = video ? "video" : pdf ? "PDF" : "image";
 			onUpdate?.({
 				content: [
 					{
 						type: "text",
 						text: video
 							? `[Extracting keyframes and analyzing video with ${VISION_MODEL}...]`
-							: `[Analyzing image with ${VISION_MODEL}...]`,
+							: pdf
+								? `[Analyzing PDF with ${VISION_MODEL}...]`
+								: `[Analyzing image with ${VISION_MODEL}...]`,
 					},
 				],
 				details: {},
@@ -345,14 +459,16 @@ export default function (pi: ExtensionAPI) {
 
 			try {
 				const summaryText = video
-					? await analyzeVideo({ absolutePath })
-					: await analyzeImage({ absolutePath });
+					? await analyzeVideo({ absolutePath, signal })
+					: pdf
+						? await analyzePdf({ absolutePath, signal })
+						: await analyzeImage({ absolutePath, signal });
 
 				if (signal?.aborted) {
 					throw new Error("Operation aborted");
 				}
 
-				const label = video ? "Video" : "Image";
+				const label = video ? "Video" : pdf ? "PDF" : "Image";
 				const result = {
 					content: [{ type: "text" as const, text: `[${label} analyzed with ${VISION_MODEL}]\n\n${summaryText}` }],
 					details: {},
