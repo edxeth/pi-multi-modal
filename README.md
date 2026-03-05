@@ -48,8 +48,13 @@ pi -e git:github.com/Whamp/glm-vision
 Once installed, the extension loads automatically when you start pi:
 
 ```bash
-pi --provider zai --model glm-4.7
+pi --provider zai-coding-plan --model glm-4.7
 ```
+
+Media analysis uses:
+
+- provider: `zai-coding-plan`
+- model: `glm-4.6v`
 
 ### Automatic Mode
 
@@ -90,8 +95,7 @@ npm install
 # Run unit tests
 npm run test
 
-# Run integration tests (requires ZAI_API_KEY)
-export ZAI_API_KEY="your-api-key"
+# Run integration tests
 npm run test:integration
 
 # Type check
@@ -106,11 +110,14 @@ See [test-fixtures/README.md](./test-fixtures/README.md) for test image details 
 
 ## Configuration
 
-The extension uses the ZAI provider for the vision model. Make sure you have proper API credentials configured:
+Vision backend:
 
 ```bash
-export ZAI_API_KEY="your-api-key"
+provider = zai-coding-plan
+model = glm-4.6v
 ```
+
+Credentials for `zai-coding-plan` can come from environment variables, `~/.pi/agent/auth.json`, or `~/.pi/agent/models.json`, depending on how the provider is configured in pi.
 
 Video analysis also requires `ffmpeg`/`ffprobe` to be available in your PATH.
 

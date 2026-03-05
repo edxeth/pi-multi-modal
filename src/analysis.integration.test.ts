@@ -7,7 +7,7 @@
  *   npm run test:integration
  *
  * Prerequisites:
- * - ZAI_API_KEY environment variable set
+ * - Credentials available for the default vision backend (`zai-coding-plan`)
  * - Sample images in test-fixtures/ directory (see README)
  */
 
@@ -15,8 +15,8 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import { beforeAll, describe, expect, it } from "vitest";
-import { extractTextFromPiOutput } from "./utils.js";
+import { describe, expect, it } from "vitest";
+import { extractTextFromPiOutput, VISION_MODEL, VISION_PROVIDER } from "./utils.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = resolvePath(__dirname, "../test-fixtures");
@@ -135,9 +135,9 @@ async function analyzeImageWithPi(imagePath: string, useStructuredPrompt = false
 		const args = [
 			`@${imagePath}`,
 			"--provider",
-			"zai",
+			VISION_PROVIDER,
 			"--model",
-			"glm-4.6v",
+			VISION_MODEL,
 			"-p",
 			useStructuredPrompt ? ANALYSIS_PROMPT : "Analyze this image comprehensively.",
 			"--json",
@@ -191,11 +191,6 @@ function containsKeywords(response: string, keywords: string[]): boolean {
 }
 
 describe("Integration: Generic prompt (baseline)", () => {
-	beforeAll(() => {
-		if (!process.env.ZAI_API_KEY) {
-			throw new Error("ZAI_API_KEY environment variable required for integration tests");
-		}
-	});
 
 	for (const [category, config] of Object.entries(TEST_IMAGES)) {
 		const imagePath = resolvePath(FIXTURES_DIR, config.file);
@@ -215,11 +210,6 @@ describe("Integration: Generic prompt (baseline)", () => {
 });
 
 describe("Integration: Structured prompt (with classification)", () => {
-	beforeAll(() => {
-		if (!process.env.ZAI_API_KEY) {
-			throw new Error("ZAI_API_KEY environment variable required for integration tests");
-		}
-	});
 
 	for (const [category, config] of Object.entries(TEST_IMAGES)) {
 		const imagePath = resolvePath(FIXTURES_DIR, config.file);

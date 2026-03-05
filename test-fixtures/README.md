@@ -15,17 +15,13 @@ Sample images for integration testing the GLM Image Summary extension.
 
 ## Running Integration Tests
 
-Integration tests require a ZAI API key:
+Integration tests use `zai-coding-plan` / `glm-4.6v`:
 
 ```bash
-# Set your API key
-export ZAI_API_KEY="your-api-key-here"
-
-# Run integration tests
 npm run test:integration
 ```
 
-Get an API key from [Z.AI](https://z.ai).
+Make sure credentials for `zai-coding-plan` are available via environment variables or `~/.pi/agent/auth.json` / `~/.pi/agent/models.json`.
 
 **Note:** Integration tests make real API calls to GLM-4.6v and consume credits. Each full test run analyzes 12 images (~4 minutes, ~$0.10-0.20).
 

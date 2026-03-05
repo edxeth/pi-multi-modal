@@ -6,7 +6,7 @@
  * analysis.
  *
  * Usage:
- *   pi -e npm:pi-glm-image-summary --provider zai --model glm-4.7
+ *   pi -e npm:pi-glm-image-summary --provider zai-coding-plan --model glm-4.7
  */
 
 import { spawn } from "node:child_process";

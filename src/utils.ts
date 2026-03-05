@@ -4,7 +4,7 @@
  */
 
 // Configuration
-export const VISION_PROVIDER = "zai";
+export const VISION_PROVIDER = "zai-coding-plan";
 export const VISION_MODEL = "glm-4.6v";
 export const SUPPORTED_IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp"];
 export const SUPPORTED_VIDEO_EXTENSIONS = ["mp4", "mkv", "mov"];
