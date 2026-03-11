@@ -15,13 +15,13 @@ Sample images for integration testing the GLM Image Summary extension.
 
 ## Running Integration Tests
 
-Integration tests use `zai-coding-plan` / `glm-4.6v`:
+Integration tests use `zai-legacy` / `glm-4.6v`:
 
 ```bash
 npm run test:integration
 ```
 
-Make sure credentials for `zai-coding-plan` are available via environment variables or `~/.pi/agent/auth.json` / `~/.pi/agent/models.json`.
+Make sure credentials for `zai-legacy` are available via environment variables or `~/.pi/agent/auth.json` / `~/.pi/agent/models.json`.
 
 **Note:** Integration tests make real API calls to GLM-4.6v and consume credits. Each full test run analyzes 12 images (~4 minutes, ~$0.10-0.20).
 

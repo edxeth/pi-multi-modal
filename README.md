@@ -48,12 +48,12 @@ pi -e git:github.com/Whamp/glm-vision
 Once installed, the extension loads automatically when you start pi:
 
 ```bash
-pi --provider zai-coding-plan --model glm-4.7
+pi --provider zai-messages --model glm-5
 ```
 
 Media analysis uses:
 
-- provider: `zai-coding-plan`
+- provider: `zai-legacy`
 - model: `glm-4.6v`
 
 ### Automatic Mode
@@ -113,11 +113,11 @@ See [test-fixtures/README.md](./test-fixtures/README.md) for test image details 
 Vision backend:
 
 ```bash
-provider = zai-coding-plan
+provider = zai-legacy
 model = glm-4.6v
 ```
 
-Credentials for `zai-coding-plan` can come from environment variables, `~/.pi/agent/auth.json`, or `~/.pi/agent/models.json`, depending on how the provider is configured in pi.
+For GLM text models, start pi with `zai-messages` (for example `pi --provider zai-messages --model glm-5`). Credentials for `zai-legacy` can come from environment variables, `~/.pi/agent/auth.json`, or `~/.pi/agent/models.json`, depending on how the provider is configured in pi.
 
 Video analysis also requires `ffmpeg`/`ffprobe` to be available in your PATH.
 

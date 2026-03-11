@@ -7,7 +7,7 @@
  *   npm run test:integration
  *
  * Prerequisites:
- * - Credentials available for the default vision backend (`zai-coding-plan`)
+ * - Credentials available for the default vision backend (`zai-legacy`)
  * - Sample images in test-fixtures/ directory (see README)
  */
 
@@ -191,7 +191,6 @@ function containsKeywords(response: string, keywords: string[]): boolean {
 }
 
 describe("Integration: Generic prompt (baseline)", () => {
-
 	for (const [category, config] of Object.entries(TEST_IMAGES)) {
 		const imagePath = resolvePath(FIXTURES_DIR, config.file);
 
@@ -210,7 +209,6 @@ describe("Integration: Generic prompt (baseline)", () => {
 });
 
 describe("Integration: Structured prompt (with classification)", () => {
-
 	for (const [category, config] of Object.entries(TEST_IMAGES)) {
 		const imagePath = resolvePath(FIXTURES_DIR, config.file);
 
