@@ -1,25 +1,28 @@
 /**
- * GLM Image Summary Extension
+ * Vision fallback extension.
  *
- * When using non-vision GLM models (glm-4.6, glm-4.7, glm-4.7-flash, glm-5), this
- * extension intercepts image/video reads and sends them to glm-4.6v for detailed
- * analysis.
- *
- * Usage:
- *   pi -e npm:pi-glm-image-summary --provider zai-messages --model glm-5
+ * For any model without native image input support, this extension can attach explicit
+ * @image paths directly in the conversation, and it proxies media analysis through
+ * glm-4.6v for non-vision read requests.
  */
 
 import { spawn } from "node:child_process";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { access, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import type { ImageContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { BorderedLoader, createReadTool } from "@mariozechner/pi-coding-agent";
 import {
 	extractTextFromPiOutput,
+	findImageReferences,
 	isImageFile,
 	isPdfFile,
 	isVideoFile,
 	needsVisionProxy,
+	replaceExplicitInlineImagePathsWithPlaceholders,
+	sanitizeImagePromptForProvider,
+	supportsNativeImageInput,
 	VISION_MODEL,
 	VISION_PROVIDER,
 } from "./utils.js";
@@ -130,6 +133,54 @@ Always start your response with:
 
 Then provide your detailed analysis.`;
 
+function mimeTypeForImagePath(path: string): ImageContent["mimeType"] | undefined {
+	const ext = path.split(".").pop()?.toLowerCase();
+	switch (ext) {
+		case "jpg":
+		case "jpeg":
+			return "image/jpeg";
+		case "png":
+			return "image/png";
+		case "gif":
+			return "image/gif";
+		case "webp":
+			return "image/webp";
+		default:
+			return undefined;
+	}
+}
+
+function resolveUserPath(cwd: string, inputPath: string): string {
+	if (inputPath === "~") {
+		return homedir();
+	}
+	if (inputPath.startsWith("~/")) {
+		return join(homedir(), inputPath.slice(2));
+	}
+	return resolve(cwd, inputPath);
+}
+
+async function loadImageAttachment(cwd: string, inputPath: string): Promise<ImageContent | null> {
+	const absolutePath = resolveUserPath(cwd, inputPath);
+	if (!isImageFile(absolutePath)) {
+		return null;
+	}
+
+	try {
+		await access(absolutePath);
+	} catch {
+		return null;
+	}
+
+	const mimeType = mimeTypeForImagePath(absolutePath);
+	if (!mimeType) {
+		return null;
+	}
+
+	const data = (await readFile(absolutePath)).toString("base64");
+	return { type: "image", data, mimeType };
+}
+
 interface AnalyzeImageOptions {
 	absolutePath: string;
 	signal?: AbortSignal;
@@ -148,17 +199,25 @@ interface AnalyzePdfOptions {
 interface AnalyzeWithPiOptions {
 	attachmentPaths: string[];
 	prompt: string;
+	provider: string;
+	model: string;
 	signal?: AbortSignal;
 }
 
-async function analyzeWithPi({ attachmentPaths, prompt, signal }: AnalyzeWithPiOptions): Promise<string> {
+async function analyzeWithPi({
+	attachmentPaths,
+	prompt,
+	provider,
+	model,
+	signal,
+}: AnalyzeWithPiOptions): Promise<string> {
 	return new Promise((resolvePromise, reject) => {
 		const args = [
 			...attachmentPaths.map((path) => `@${path}`),
 			"--provider",
-			VISION_PROVIDER,
+			provider,
 			"--model",
-			VISION_MODEL,
+			model,
 			"--print",
 			"--json",
 			"--no-extensions",
@@ -211,6 +270,8 @@ async function analyzeImage({ absolutePath, signal }: AnalyzeImageOptions): Prom
 	return analyzeWithPi({
 		attachmentPaths: [absolutePath],
 		prompt: IMAGE_ANALYSIS_PROMPT,
+		provider: VISION_PROVIDER,
+		model: VISION_MODEL,
 		signal,
 	});
 }
@@ -278,6 +339,8 @@ async function analyzePdf({ absolutePath, signal }: AnalyzePdfOptions): Promise<
 		const analysis = await analyzeWithPi({
 			attachmentPaths: pages,
 			prompt: `${PDF_ANALYSIS_PROMPT}\n\nThe attached images are rendered pages from a PDF in order.`,
+			provider: VISION_PROVIDER,
+			model: VISION_MODEL,
 			signal,
 		});
 		succeeded = true;
@@ -410,6 +473,8 @@ async function analyzeVideo({ absolutePath, signal }: AnalyzeVideoOptions): Prom
 		const analysis = await analyzeWithPi({
 			attachmentPaths: frames,
 			prompt: VIDEO_ANALYSIS_PROMPT,
+			provider: VISION_PROVIDER,
+			model: VISION_MODEL,
 			signal,
 		});
 		succeeded = true;
@@ -427,6 +492,101 @@ async function analyzeVideo({ absolutePath, signal }: AnalyzeVideoOptions): Prom
 
 export default function (pi: ExtensionAPI) {
 	const localRead = createReadTool(process.cwd());
+
+	pi.on("input", async (event, ctx) => {
+		if (!supportsNativeImageInput(ctx.model?.input)) {
+			return { action: "continue" };
+		}
+
+		const matches = findImageReferences(event.text);
+		if (matches.length === 0) {
+			return { action: "continue" };
+		}
+
+		const attachments = [...(event.images ?? [])];
+		let changed = false;
+
+		for (const match of matches) {
+			if (match.kind !== "path") {
+				continue;
+			}
+			const explicitPath = match.fullMatch.slice(match.prefix.length).startsWith("@");
+			if (!explicitPath) {
+				continue;
+			}
+
+			const loaded = await loadImageAttachment(ctx.cwd, match.path);
+			if (!loaded) {
+				continue;
+			}
+
+			attachments.push(loaded);
+			changed = true;
+		}
+
+		if (!changed) {
+			return { action: "continue" };
+		}
+
+		return {
+			action: "transform",
+			text: event.text,
+			images: attachments,
+		};
+	});
+
+	pi.on("context", (event, ctx) => {
+		if (!supportsNativeImageInput(ctx.model?.input)) {
+			return undefined;
+		}
+
+		const messages = structuredClone(event.messages);
+		let changed = false;
+
+		for (const message of messages) {
+			if (message.role !== "user") {
+				continue;
+			}
+			if (typeof message.content === "string") {
+				const sanitized = replaceExplicitInlineImagePathsWithPlaceholders(
+					sanitizeImagePromptForProvider(message.content),
+				);
+				if (sanitized !== message.content) {
+					message.content = sanitized;
+					changed = true;
+				}
+				continue;
+			}
+
+			const imageBlocks = message.content.filter((block) => block.type === "image");
+			const textBlocks = message.content
+				.filter((block) => block.type === "text")
+				.map((block) => {
+					const sanitized = replaceExplicitInlineImagePathsWithPlaceholders(sanitizeImagePromptForProvider(block.text));
+					if (sanitized !== block.text) {
+						changed = true;
+					}
+					return { ...block, text: sanitized };
+				});
+			const otherBlocks = message.content.filter((block) => block.type !== "image" && block.type !== "text");
+
+			if (imageBlocks.length > 0) {
+				const reordered = [...imageBlocks, ...textBlocks, ...otherBlocks];
+				if (JSON.stringify(reordered) !== JSON.stringify(message.content)) {
+					message.content = reordered;
+					changed = true;
+				}
+			} else if (textBlocks.length > 0 || otherBlocks.length > 0) {
+				const rebuilt = [...textBlocks, ...otherBlocks];
+				if (JSON.stringify(rebuilt) !== JSON.stringify(message.content)) {
+					message.content = rebuilt;
+					changed = true;
+				}
+			}
+		}
+
+		return changed ? { messages } : undefined;
+	});
 
 	// Override read to intercept image/video/PDF reads for non-vision models
 	pi.registerTool({

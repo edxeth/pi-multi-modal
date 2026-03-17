@@ -1,10 +1,10 @@
 # glm-vision
 
-A [pi](https://github.com/badlogic/pi-mono) extension that intercepts image/video reads when using non-vision GLM models and sends them to GLM-4.6v for detailed analysis.
+A [pi](https://github.com/badlogic/pi-mono) extension that proxies media analysis through GLM-4.6v for models without native image support.
 
 ## Why?
 
-GLM text models (glm-4.6, glm-4.7, glm-4.7-flash, glm-5) have no vision capabilities. GLM-4.6v does. This extension automatically detects when you're using a non-vision GLM model and intercepts image/video reads:
+Some models have no vision capabilities. GLM-4.6v does. This extension detects when the active model lacks native image support and proxies media analysis through GLM-4.6v:
 
 1. **Images** are sent directly to GLM-4.6v with a structured classification prompt.
 2. **Videos** are sampled into keyframes locally (via `ffmpeg`), then analyzed by GLM-4.6v in chronological order.
@@ -13,7 +13,7 @@ This approach is [48% faster and produces higher quality output](./test-fixtures
 
 ## Features
 
-- **Automatic media interception**: When using glm-4.6, glm-4.7, glm-4.7-flash, or glm-5, supported image/video file reads are automatically redirected to glm-4.6v
+- **Automatic media interception**: Supported image/video file reads are redirected to glm-4.6v when the active model has no native image support
 - **Image classification**: Images are categorized (UI, code, error, diagram, chart, general) for targeted analysis
 - **Video support for local files**: Videos are converted to chronological keyframes via `ffmpeg`, then summarized by GLM-4.6v
 - **Specialized prompts**:
@@ -59,7 +59,7 @@ Media analysis uses:
 ### Automatic Mode
 
 When the extension detects:
-1. Current model is `glm-4.6`, `glm-4.7`, `glm-4.7-flash`, or `glm-5`
+1. The current model has no native image support
 2. A file being read is a supported image/video format
 
 It will automatically spawn a subprocess with glm-4.6v to analyze the media and return a structured summary.
@@ -117,7 +117,7 @@ provider = zai-legacy
 model = glm-4.6v
 ```
 
-For GLM text models, start pi with `zai-messages` (for example `pi --provider zai-messages --model glm-5`). Credentials for `zai-legacy` can come from environment variables, `~/.pi/agent/auth.json`, or `~/.pi/agent/models.json`, depending on how the provider is configured in pi.
+If you want to use the default GLM-based vision backend, make sure `zai-legacy` credentials are available. They can come from environment variables, `~/.pi/agent/auth.json`, or `~/.pi/agent/models.json`, depending on how the provider is configured in pi.
 
 Video analysis also requires `ffmpeg`/`ffprobe` to be available in your PATH.
 
