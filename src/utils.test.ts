@@ -4,6 +4,7 @@ import {
 	colorizeImagePlaceholders,
 	extractAvailableVisionProviders,
 	extractTextFromPiOutput,
+	findExplicitMediaPaths,
 	findImagePlaceholderIds,
 	findImageReferences,
 	findInlineImagePaths,
@@ -156,6 +157,16 @@ describe("inline image path helpers", () => {
 	it("finds @-prefixed inline image paths without the @", () => {
 		const text = "Compare @/tmp/a.png with @./b.webp";
 		expect(findInlineImagePaths(text)).toEqual(["/tmp/a.png", "./b.webp"]);
+	});
+
+	it("finds explicit @-prefixed media paths for vision opt-in", () => {
+		const text = "Analyze @/tmp/a.png, @./demo.mp4, and @../doc.pdf but ignore ./plain.png";
+		expect(findExplicitMediaPaths(text)).toEqual(["/tmp/a.png", "./demo.mp4", "../doc.pdf"]);
+	});
+
+	it("ignores non-media @ paths when collecting explicit media refs", () => {
+		const text = "Use @./notes.md and @./photo.png";
+		expect(findExplicitMediaPaths(text)).toEqual(["./photo.png"]);
 	});
 
 	it("replaces inline image paths with numbered placeholders", () => {

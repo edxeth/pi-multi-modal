@@ -15,6 +15,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { BorderedLoader, createReadTool } from "@mariozechner/pi-coding-agent";
 import {
 	extractTextFromPiOutput,
+	findExplicitMediaPaths,
 	findImageReferences,
 	getAvailableVisionProviders,
 	isImageFile,
@@ -539,8 +540,17 @@ async function analyzeVideo({ absolutePath, preferredProvider, signal }: Analyze
 
 export default function (pi: ExtensionAPI) {
 	const localRead = createReadTool(process.cwd());
+	let explicitMediaAnalysisPaths = new Set<string>();
+
+	pi.on("turn_end", () => {
+		explicitMediaAnalysisPaths = new Set<string>();
+	});
 
 	pi.on("input", async (event, ctx) => {
+		explicitMediaAnalysisPaths = new Set(
+			findExplicitMediaPaths(event.text).map((path) => resolveUserPath(ctx.cwd, path)),
+		);
+
 		if (!supportsNativeImageInput(ctx.model?.input)) {
 			return { action: "continue" };
 		}
@@ -640,12 +650,16 @@ export default function (pi: ExtensionAPI) {
 		...localRead,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const { path } = params;
-			const absolutePath = resolve(ctx.cwd, path);
+			const absolutePath = resolveUserPath(ctx.cwd, path);
 			const image = isImageFile(absolutePath);
 			const video = isVideoFile(absolutePath);
 			const pdf = isPdfFile(absolutePath);
 
 			if (!needsVisionProxy(ctx.model?.input) || (!image && !video && !pdf)) {
+				return localRead.execute(toolCallId, params, signal, onUpdate);
+			}
+
+			if (!explicitMediaAnalysisPaths.has(absolutePath)) {
 				return localRead.execute(toolCallId, params, signal, onUpdate);
 			}
 

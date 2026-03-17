@@ -1,125 +1,149 @@
-# glm-vision
+# pi-multi-modal
 
-A [pi](https://github.com/badlogic/pi-mono) extension that proxies media analysis through GLM-4.6v for models without native image support.
+A [pi](https://github.com/badlogic/pi-mono) extension for local media paths.
 
-## Why?
+It does two different jobs depending on the active model:
 
-Some models have no vision capabilities. GLM-4.6v does. This extension detects when the active model lacks native image support and proxies media analysis through GLM-4.6v:
+- **Models with native image input**: explicit `@./image.png` paths are attached as real image inputs.
+- **Models without native image input**: explicit `@./image.png`, `@./video.mp4`, or `@./file.pdf` paths opt into GLM-based media analysis when the agent reads that same file.
 
-1. **Images** are sent directly to GLM-4.6v with a structured classification prompt.
-2. **Videos** are sampled into keyframes locally (via `ffmpeg`), then analyzed by GLM-4.6v in chronological order.
+## Behavior
 
-This approach is [48% faster and produces higher quality output](./test-fixtures/README.md#performance-comparison-generic-vs-structured-prompt) compared to a generic "analyze this image" prompt.
+### 1) Native image-input models
+
+For models that already support images, the extension keeps the normal explicit-attachment workflow:
+
+```text
+Compare @./before.png and @./after.png
+```
+
+What happens:
+- the image files are attached to the current conversation
+- the visible path text is rewritten to placeholders like `[Image #1]`
+- the active model handles the image directly
+
+This path is for **images only**.
+
+### 2) Non-vision models
+
+For text-only models, `@path` becomes an explicit opt-in for media analysis.
+
+```text
+Analyze @./screenshot.png
+Summarize @./demo.mp4
+Review @./report.pdf
+```
+
+What happens:
+- the `@path` marks that file as intentionally analyzable media
+- if the agent later uses the `read` tool on that same path, the extension intercepts it
+- the file is analyzed with `glm-4.6v`
+- the agent receives a structured summary instead of raw file contents
+
+Plain paths without `@` are left alone. That means requests like these stay safe:
+
+```text
+Add ./preview-1.png and ./preview-2.png to my README
+List all image paths mentioned in this document
+```
+
+## Vision backend
+
+Media proxy analysis uses:
+
+- provider: `zai` when available, otherwise `zai-legacy`
+- model: `glm-4.6v`
+
+Provider selection is resolved from the current pi instance without the slow `pi --list-models` subprocess probe.
 
 ## Features
 
-- **Automatic media interception**: Supported image/video file reads are redirected to glm-4.6v when the active model has no native image support
-- **Image classification**: Images are categorized (UI, code, error, diagram, chart, general) for targeted analysis
-- **Video support for local files**: Videos are converted to chronological keyframes via `ffmpeg`, then summarized by GLM-4.6v
-- **Specialized prompts**:
-  - **Code screenshots**: Extracts actual code with line numbers
-  - **Error screenshots**: Provides root cause analysis and fix suggestions
-  - **Diagrams**: Lists components, relationships, and protocols
-  - **Charts**: Extracts data values, trends, and insights
-- **Manual analysis commands**: `/analyze-image <path>` and `/analyze-video <path>`
+- explicit `@path` handling for native image-input models
+- explicit opt-in media analysis for non-vision models
+- image classification for screenshots, diagrams, charts, and general images
+- video analysis via local keyframe extraction with `ffmpeg`
+- PDF analysis via rendered page images
+- manual commands:
+  - `/analyze-image <path>`
+  - `/analyze-video <path>`
 
 ## Installation
 
 Install globally:
 
 ```bash
-pi install git:github.com/Whamp/glm-vision
+pi install git:github.com/edxeth/pi-multi-modal
 ```
 
-Or install for a specific project (writes to `.pi/settings.json`):
+Install for the current project:
 
 ```bash
-pi install -l git:github.com/Whamp/glm-vision
+pi install -l git:github.com/edxeth/pi-multi-modal
 ```
 
-To try it without installing:
+Try it without installing:
 
 ```bash
-pi -e git:github.com/Whamp/glm-vision
+pi -e git:github.com/edxeth/pi-multi-modal
 ```
 
 ## Usage
 
-Once installed, the extension loads automatically when you start pi:
+Example with a vision-capable model:
 
 ```bash
 pi --provider zai-messages --model glm-5
 ```
 
-Media analysis uses:
+Then in the prompt:
 
-- provider: `zai` when available, otherwise `zai-legacy`
-- model: `glm-4.6v`
-
-### Automatic Mode
-
-When the extension detects:
-1. The current model has no native image support
-2. A file being read is a supported image/video format
-
-It will automatically spawn a subprocess with glm-4.6v to analyze the media and return a structured summary.
-
-### Manual Analysis
-
-Use the manual commands:
-
-```
-/analyze-image ./screenshot.png
-/analyze-video ./recording.mp4
+```text
+Compare @./before.png and @./after.png
 ```
 
-## Supported Formats
+Example with a non-vision model:
 
-### Images
-- JPEG (.jpg, .jpeg)
-- PNG (.png)
-- GIF (.gif)
-- WebP (.webp)
-
-### Videos
-- MP4 (.mp4)
-- Matroska (.mkv)
-- QuickTime (.mov)
-
-## Development
-
-```bash
-# Install dependencies
-npm install
-
-# Run unit tests
-npm run test
-
-# Run integration tests
-npm run test:integration
-
-# Type check
-npm run typecheck
-
-# Lint and format
-npm run check
-npm run format
+```text
+Analyze @./screenshot.png and explain the error
 ```
 
-See [test-fixtures/README.md](./test-fixtures/README.md) for test image details and performance benchmarks.
+If the agent reads `./screenshot.png`, the extension routes that read through `glm-4.6v`.
+
+## Supported formats
+
+### Native attachment path
+- JPEG (`.jpg`, `.jpeg`)
+- PNG (`.png`)
+- GIF (`.gif`)
+- WebP (`.webp`)
+
+### Non-vision media proxy path
+- Images: `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`
+- Videos: `.mp4`, `.mkv`, `.mov`
+- PDFs: `.pdf`
 
 ## Configuration
 
-Vision backend:
-
-```bash
+```text
 provider = zai | zai-legacy
 model = glm-4.6v
 ```
 
-The extension prefers `zai` and automatically falls back to `zai-legacy`. Make sure at least one of them is configured in pi. Credentials can come from environment variables, `~/.pi/agent/auth.json`, or `~/.pi/agent/models.json`, depending on how the provider is configured in pi.
+The extension prefers `zai` and falls back to `zai-legacy`.
 
-Video analysis also requires `ffmpeg`/`ffprobe` to be available in your PATH.
+Video analysis requires `ffmpeg` and `ffprobe` in `PATH`.
+PDF analysis requires `gs` (Ghostscript) in `PATH`.
+
+## Development
+
+```bash
+npm install
+npm run check
+npm test
+npm run test:integration
+```
+
+See [test-fixtures/README.md](./test-fixtures/README.md) for fixture details and benchmarks.
 
 ## License
 

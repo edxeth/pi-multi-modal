@@ -14,6 +14,7 @@ export const SUPPORTED_IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp"];
 export const SUPPORTED_VIDEO_EXTENSIONS = ["mp4", "mkv", "mov"];
 export const SUPPORTED_PDF_EXTENSIONS = ["pdf"];
 const INLINE_IMAGE_PATH_REGEX = /(^|\s|\(|:|\[)(@?((?:~|\/|\.\.?\/)[^\s)\]}"']+\.(?:jpg|jpeg|png|gif|webp)))/gim;
+const INLINE_EXPLICIT_MEDIA_PATH_REGEX = /(^|\s|\(|:|\[)(@((?:~|\/|\.\.?\/)[^\s)\]}"']+\.[a-z0-9]+))/gim;
 const VISION_PROVIDER_RETRYABLE_ERROR_REGEX =
 	/no api key found|unknown provider|no models matching|no models available|unknown model/i;
 let resolvedVisionProviderPromise: Promise<string> | undefined;
@@ -145,6 +146,10 @@ export function isPdfFile(path: string): boolean {
 	return ext !== undefined && SUPPORTED_PDF_EXTENSIONS.includes(ext);
 }
 
+export function isMediaFile(path: string): boolean {
+	return isImageFile(path) || isVideoFile(path) || isPdfFile(path);
+}
+
 /**
  * Check if a model needs vision proxy based on capability.
  * Models with input=["text"] (no "image") need proxy for media reads.
@@ -167,6 +172,20 @@ export function findInlineImagePaths(text: string): string[] {
 	const matches: string[] = [];
 	for (const match of text.matchAll(INLINE_IMAGE_PATH_REGEX)) {
 		if (match[3]) matches.push(match[3]);
+	}
+	return matches;
+}
+
+/**
+ * Find explicit @-prefixed media paths that should opt into vision analysis.
+ */
+export function findExplicitMediaPaths(text: string): string[] {
+	const matches: string[] = [];
+	for (const match of text.matchAll(INLINE_EXPLICIT_MEDIA_PATH_REGEX)) {
+		const path = match[3];
+		if (path && isMediaFile(path)) {
+			matches.push(path);
+		}
 	}
 	return matches;
 }
