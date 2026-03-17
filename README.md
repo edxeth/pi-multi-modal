@@ -53,7 +53,7 @@ pi --provider zai-messages --model glm-5
 
 Media analysis uses:
 
-- provider: `zai-legacy`
+- provider: `zai` when available, otherwise `zai-legacy`
 - model: `glm-4.6v`
 
 ### Automatic Mode
@@ -113,11 +113,11 @@ See [test-fixtures/README.md](./test-fixtures/README.md) for test image details 
 Vision backend:
 
 ```bash
-provider = zai-legacy
+provider = zai | zai-legacy
 model = glm-4.6v
 ```
 
-If you want to use the default GLM-based vision backend, make sure `zai-legacy` credentials are available. They can come from environment variables, `~/.pi/agent/auth.json`, or `~/.pi/agent/models.json`, depending on how the provider is configured in pi.
+The extension prefers `zai` and automatically falls back to `zai-legacy`. Make sure at least one of them is configured in pi. Credentials can come from environment variables, `~/.pi/agent/auth.json`, or `~/.pi/agent/models.json`, depending on how the provider is configured in pi.
 
 Video analysis also requires `ffmpeg`/`ffprobe` to be available in your PATH.
 

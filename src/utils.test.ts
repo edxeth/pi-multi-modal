@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	buildImageReferenceSuffix,
 	colorizeImagePlaceholders,
+	extractAvailableVisionProviders,
 	extractTextFromPiOutput,
 	findImagePlaceholderIds,
 	findImageReferences,
@@ -9,13 +10,36 @@ import {
 	isImageFile,
 	isVideoFile,
 	needsVisionProxy,
+	pickPreferredVisionProvider,
 	replaceExplicitInlineImagePathsWithPlaceholders,
 	replaceInlineImagePathsWithPlaceholders,
 	SUPPORTED_IMAGE_EXTENSIONS,
 	SUPPORTED_VIDEO_EXTENSIONS,
 	sanitizeImagePromptForProvider,
+	shouldRetryWithFallbackVisionProvider,
 	supportsNativeImageInput,
 } from "./utils.js";
+
+describe("vision provider helpers", () => {
+	it("parses available glm-4.6v providers from pi output", () => {
+		const output = `provider      model        context  max-out  thinking  images
+zai-legacy    glm-4.6v     131.1K   32.8K    no        yes
+zai           glm-4.6v     131.1K   32.8K    no        yes
+zai-messages  glm-5-turbo  202.8K   128K     yes       no`;
+		expect(extractAvailableVisionProviders(output)).toEqual(["zai-legacy", "zai"]);
+	});
+
+	it("prefers zai over zai-legacy when both are available", () => {
+		expect(pickPreferredVisionProvider(["zai-legacy", "zai"])).toBe("zai");
+		expect(pickPreferredVisionProvider(["zai-legacy"])).toBe("zai-legacy");
+	});
+
+	it("retries provider fallback for auth or provider resolution errors", () => {
+		expect(shouldRetryWithFallbackVisionProvider(new Error("No API key found for zai."))).toBe(true);
+		expect(shouldRetryWithFallbackVisionProvider(new Error('No models matching "glm-4.6v"'))).toBe(true);
+		expect(shouldRetryWithFallbackVisionProvider(new Error("Connection reset by peer"))).toBe(false);
+	});
+});
 
 describe("isImageFile", () => {
 	it("returns true for supported image extensions", () => {

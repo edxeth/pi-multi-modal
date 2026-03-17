@@ -16,15 +16,18 @@ import { BorderedLoader, createReadTool } from "@mariozechner/pi-coding-agent";
 import {
 	extractTextFromPiOutput,
 	findImageReferences,
+	getAvailableVisionProviders,
 	isImageFile,
 	isPdfFile,
 	isVideoFile,
 	needsVisionProxy,
+	pickPreferredVisionProvider,
 	replaceExplicitInlineImagePathsWithPlaceholders,
 	sanitizeImagePromptForProvider,
+	shouldRetryWithFallbackVisionProvider,
 	supportsNativeImageInput,
 	VISION_MODEL,
-	VISION_PROVIDER,
+	VISION_PROVIDER_CANDIDATES,
 } from "./utils.js";
 
 // Embedded skill prompt for GLM-4.6v
@@ -183,34 +186,50 @@ async function loadImageAttachment(cwd: string, inputPath: string): Promise<Imag
 
 interface AnalyzeImageOptions {
 	absolutePath: string;
+	preferredProvider: string;
 	signal?: AbortSignal;
 }
 
 interface AnalyzeVideoOptions {
 	absolutePath: string;
+	preferredProvider: string;
 	signal?: AbortSignal;
 }
 
 interface AnalyzePdfOptions {
 	absolutePath: string;
+	preferredProvider: string;
 	signal?: AbortSignal;
 }
 
-interface AnalyzeWithPiOptions {
+interface AnalyzeWithPiBaseOptions {
 	attachmentPaths: string[];
 	prompt: string;
-	provider: string;
 	model: string;
 	signal?: AbortSignal;
 }
 
-async function analyzeWithPi({
+interface AnalyzeWithPiOptions extends AnalyzeWithPiBaseOptions {
+	preferredProvider: string;
+}
+
+interface AnalyzeWithPiProviderOptions extends AnalyzeWithPiBaseOptions {
+	provider: string;
+}
+
+function resolvePreferredVisionProvider(modelRegistry: {
+	getAvailable(): Array<{ provider: string; id: string }>;
+}): string {
+	return pickPreferredVisionProvider(getAvailableVisionProviders(modelRegistry.getAvailable()));
+}
+
+async function analyzeWithPiProvider({
 	attachmentPaths,
 	prompt,
 	provider,
 	model,
 	signal,
-}: AnalyzeWithPiOptions): Promise<string> {
+}: AnalyzeWithPiProviderOptions): Promise<string> {
 	return new Promise((resolvePromise, reject) => {
 		const args = [
 			...attachmentPaths.map((path) => `@${path}`),
@@ -266,12 +285,40 @@ async function analyzeWithPi({
 	});
 }
 
-async function analyzeImage({ absolutePath, signal }: AnalyzeImageOptions): Promise<string> {
+async function analyzeWithPi({
+	attachmentPaths,
+	prompt,
+	model,
+	preferredProvider,
+	signal,
+}: AnalyzeWithPiOptions): Promise<string> {
+	const providers = [
+		preferredProvider,
+		...VISION_PROVIDER_CANDIDATES.filter((provider) => provider !== preferredProvider),
+	];
+	let lastError: unknown;
+
+	for (const [index, provider] of providers.entries()) {
+		try {
+			return await analyzeWithPiProvider({ attachmentPaths, prompt, provider, model, signal });
+		} catch (error) {
+			lastError = error;
+			const hasFallback = index < providers.length - 1;
+			if (!hasFallback || !shouldRetryWithFallbackVisionProvider(error)) {
+				throw error;
+			}
+		}
+	}
+
+	throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function analyzeImage({ absolutePath, preferredProvider, signal }: AnalyzeImageOptions): Promise<string> {
 	return analyzeWithPi({
 		attachmentPaths: [absolutePath],
 		prompt: IMAGE_ANALYSIS_PROMPT,
-		provider: VISION_PROVIDER,
 		model: VISION_MODEL,
+		preferredProvider,
 		signal,
 	});
 }
@@ -326,7 +373,7 @@ async function extractPdfPages(absolutePath: string, pagesDir: string, signal?: 
 		.map((name) => join(pagesDir, name));
 }
 
-async function analyzePdf({ absolutePath, signal }: AnalyzePdfOptions): Promise<string> {
+async function analyzePdf({ absolutePath, preferredProvider, signal }: AnalyzePdfOptions): Promise<string> {
 	const pagesDir = await mkdtemp(join(process.cwd(), ".glm-vision-pdf-"));
 	let succeeded = false;
 
@@ -339,8 +386,8 @@ async function analyzePdf({ absolutePath, signal }: AnalyzePdfOptions): Promise<
 		const analysis = await analyzeWithPi({
 			attachmentPaths: pages,
 			prompt: `${PDF_ANALYSIS_PROMPT}\n\nThe attached images are rendered pages from a PDF in order.`,
-			provider: VISION_PROVIDER,
 			model: VISION_MODEL,
+			preferredProvider,
 			signal,
 		});
 		succeeded = true;
@@ -460,7 +507,7 @@ async function extractVideoFrames(absolutePath: string, framesDir: string, signa
 		.map((name) => join(framesDir, name));
 }
 
-async function analyzeVideo({ absolutePath, signal }: AnalyzeVideoOptions): Promise<string> {
+async function analyzeVideo({ absolutePath, preferredProvider, signal }: AnalyzeVideoOptions): Promise<string> {
 	const framesDir = await mkdtemp(join(process.cwd(), ".glm-vision-frames-"));
 	let succeeded = false;
 
@@ -473,8 +520,8 @@ async function analyzeVideo({ absolutePath, signal }: AnalyzeVideoOptions): Prom
 		const analysis = await analyzeWithPi({
 			attachmentPaths: frames,
 			prompt: VIDEO_ANALYSIS_PROMPT,
-			provider: VISION_PROVIDER,
 			model: VISION_MODEL,
+			preferredProvider,
 			signal,
 		});
 		succeeded = true;
@@ -618,11 +665,12 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			try {
+				const preferredProvider = resolvePreferredVisionProvider(ctx.modelRegistry);
 				const summaryText = video
-					? await analyzeVideo({ absolutePath, signal })
+					? await analyzeVideo({ absolutePath, preferredProvider, signal })
 					: pdf
-						? await analyzePdf({ absolutePath, signal })
-						: await analyzeImage({ absolutePath, signal });
+						? await analyzePdf({ absolutePath, preferredProvider, signal })
+						: await analyzeImage({ absolutePath, preferredProvider, signal });
 
 				if (signal?.aborted) {
 					throw new Error("Operation aborted");
@@ -665,11 +713,12 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			const preferredProvider = resolvePreferredVisionProvider(ctx.modelRegistry);
 			const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
 				const loader = new BorderedLoader(tui, theme, `Analyzing ${imagePath}...`);
 				loader.onAbort = () => done(null);
 
-				analyzeImage({ absolutePath, signal: loader.signal })
+				analyzeImage({ absolutePath, preferredProvider, signal: loader.signal })
 					.then((text) => done(text))
 					.catch((err) => {
 						ctx.ui.notify(`Analysis failed: ${err.message}`, "error");
@@ -709,11 +758,12 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			const preferredProvider = resolvePreferredVisionProvider(ctx.modelRegistry);
 			const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
 				const loader = new BorderedLoader(tui, theme, `Analyzing ${videoPath}...`);
 				loader.onAbort = () => done(null);
 
-				analyzeVideo({ absolutePath, signal: loader.signal })
+				analyzeVideo({ absolutePath, preferredProvider, signal: loader.signal })
 					.then((text) => done(text))
 					.catch((err) => {
 						ctx.ui.notify(`Analysis failed: ${err.message}`, "error");

@@ -3,13 +3,20 @@
  * Extracted for testability
  */
 
+import { spawn } from "node:child_process";
+
 // Configuration
-export const VISION_PROVIDER = "zai-legacy";
+export const VISION_PROVIDER = "zai";
+export const VISION_PROVIDER_FALLBACK = "zai-legacy";
+export const VISION_PROVIDER_CANDIDATES = [VISION_PROVIDER, VISION_PROVIDER_FALLBACK] as const;
 export const VISION_MODEL = "glm-4.6v";
 export const SUPPORTED_IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp"];
 export const SUPPORTED_VIDEO_EXTENSIONS = ["mp4", "mkv", "mov"];
 export const SUPPORTED_PDF_EXTENSIONS = ["pdf"];
 const INLINE_IMAGE_PATH_REGEX = /(^|\s|\(|:|\[)(@?((?:~|\/|\.\.?\/)[^\s)\]}"']+\.(?:jpg|jpeg|png|gif|webp)))/gim;
+const VISION_PROVIDER_RETRYABLE_ERROR_REGEX =
+	/no api key found|unknown provider|no models matching|no models available|unknown model/i;
+let resolvedVisionProviderPromise: Promise<string> | undefined;
 
 export type ImageReferenceMatch =
 	| {
@@ -40,6 +47,78 @@ export interface PiContentBlock {
 
 export interface PiJsonOutput {
 	messages?: PiMessage[];
+}
+
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function extractAvailableVisionProviders(output: string, model = VISION_MODEL): string[] {
+	const matches = output.matchAll(new RegExp(`^(\\S+)\\s+${escapeRegExp(model)}(?=\\s|$)`, "gm"));
+	const providers = [...matches]
+		.map((match) => match[1])
+		.filter((provider): provider is string => provider !== undefined);
+	return [...new Set(providers.filter((provider) => VISION_PROVIDER_CANDIDATES.includes(provider as never)))];
+}
+
+export function getAvailableVisionProviders(
+	models: ReadonlyArray<{ provider: string; id: string }>,
+	model = VISION_MODEL,
+): string[] {
+	const providers = models
+		.filter((entry) => entry.id === model)
+		.map((entry) => entry.provider)
+		.filter((provider) => VISION_PROVIDER_CANDIDATES.includes(provider as never));
+	return [...new Set(providers)];
+}
+
+export function pickPreferredVisionProvider(providers: readonly string[]): string {
+	for (const provider of VISION_PROVIDER_CANDIDATES) {
+		if (providers.includes(provider)) {
+			return provider;
+		}
+	}
+	return VISION_PROVIDER;
+}
+
+export function shouldRetryWithFallbackVisionProvider(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return VISION_PROVIDER_RETRYABLE_ERROR_REGEX.test(message);
+}
+
+async function listAvailableVisionProviders(): Promise<string[]> {
+	return new Promise((resolvePromise) => {
+		const child = spawn("pi", ["--no-extensions", "--list-models", VISION_MODEL], {
+			stdio: ["ignore", "pipe", "pipe"],
+			env: process.env,
+		});
+
+		let stdout = "";
+		let stderr = "";
+
+		child.stdout.on("data", (data: Buffer) => {
+			stdout += data.toString();
+		});
+
+		child.stderr.on("data", (data: Buffer) => {
+			stderr += data.toString();
+		});
+
+		child.on("error", () => {
+			resolvePromise([]);
+		});
+
+		child.on("close", () => {
+			resolvePromise(extractAvailableVisionProviders(`${stdout}\n${stderr}`));
+		});
+	});
+}
+
+export async function resolveVisionProvider(): Promise<string> {
+	resolvedVisionProviderPromise ??= listAvailableVisionProviders().then((providers) =>
+		pickPreferredVisionProvider(providers),
+	);
+	return resolvedVisionProviderPromise;
 }
 
 /**

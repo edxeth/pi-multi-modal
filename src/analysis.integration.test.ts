@@ -7,7 +7,7 @@
  *   npm run test:integration
  *
  * Prerequisites:
- * - Credentials available for the default vision backend (`zai-legacy`)
+ * - Credentials available for `zai` or `zai-legacy` (`zai` is preferred when both work)
  * - Sample images in test-fixtures/ directory (see README)
  */
 
@@ -16,7 +16,7 @@ import { existsSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { extractTextFromPiOutput, VISION_MODEL, VISION_PROVIDER } from "./utils.js";
+import { extractTextFromPiOutput, resolveVisionProvider, VISION_MODEL } from "./utils.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = resolvePath(__dirname, "../test-fixtures");
@@ -131,11 +131,13 @@ const TEST_IMAGES: Record<string, { file: string; expectedCategory: string; keyw
  * Spawn pi with glm-4.6v to analyze an image
  */
 async function analyzeImageWithPi(imagePath: string, useStructuredPrompt = false): Promise<string> {
+	const provider = await resolveVisionProvider();
+
 	return new Promise((resolvePromise, reject) => {
 		const args = [
 			`@${imagePath}`,
 			"--provider",
-			VISION_PROVIDER,
+			provider,
 			"--model",
 			VISION_MODEL,
 			"-p",
