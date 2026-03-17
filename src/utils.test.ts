@@ -4,6 +4,7 @@ import {
 	colorizeImagePlaceholders,
 	extractAvailableVisionProviders,
 	extractTextFromPiOutput,
+	findExplicitImagePaths,
 	findExplicitMediaPaths,
 	findImagePlaceholderIds,
 	findImageReferences,
@@ -14,6 +15,7 @@ import {
 	pickPreferredVisionProvider,
 	replaceExplicitInlineImagePathsWithPlaceholders,
 	replaceInlineImagePathsWithPlaceholders,
+	resolveShowImagesSetting,
 	SUPPORTED_IMAGE_EXTENSIONS,
 	SUPPORTED_VIDEO_EXTENSIONS,
 	sanitizeImagePromptForProvider,
@@ -164,6 +166,11 @@ describe("inline image path helpers", () => {
 		expect(findExplicitMediaPaths(text)).toEqual(["/tmp/a.png", "./demo.mp4", "../doc.pdf"]);
 	});
 
+	it("finds explicit @-prefixed image paths only", () => {
+		const text = "Compare @/tmp/a.png, @./b.webp, @./demo.mp4, and ./plain.png";
+		expect(findExplicitImagePaths(text)).toEqual(["/tmp/a.png", "./b.webp"]);
+	});
+
 	it("ignores non-media @ paths when collecting explicit media refs", () => {
 		const text = "Use @./notes.md and @./photo.png";
 		expect(findExplicitMediaPaths(text)).toEqual(["./photo.png"]);
@@ -224,6 +231,22 @@ describe("inline image path helpers", () => {
 
 	it("extracts placeholder ids in order", () => {
 		expect(findImagePlaceholderIds("[Image #3] [Image #12]")).toEqual([3, 12]);
+	});
+});
+
+describe("resolveShowImagesSetting", () => {
+	it("defaults to true when setting is absent", () => {
+		expect(resolveShowImagesSetting(undefined, undefined)).toBe(true);
+	});
+
+	it("prefers project setting over global setting", () => {
+		expect(resolveShowImagesSetting({ terminal: { showImages: true } }, { terminal: { showImages: false } })).toBe(
+			false,
+		);
+	});
+
+	it("falls back to global setting when project setting is absent", () => {
+		expect(resolveShowImagesSetting({ terminal: { showImages: false } }, {})).toBe(false);
 	});
 });
 

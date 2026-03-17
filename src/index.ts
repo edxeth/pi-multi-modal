@@ -13,10 +13,11 @@ import { join, resolve } from "node:path";
 import type { ImageContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { BorderedLoader, createReadTool } from "@mariozechner/pi-coding-agent";
+import { Container, Image, Spacer } from "@mariozechner/pi-tui";
 import {
 	extractTextFromPiOutput,
+	findExplicitImagePaths,
 	findExplicitMediaPaths,
-	findImageReferences,
 	getAvailableVisionProviders,
 	isImageFile,
 	isPdfFile,
@@ -24,6 +25,7 @@ import {
 	needsVisionProxy,
 	pickPreferredVisionProvider,
 	replaceExplicitInlineImagePathsWithPlaceholders,
+	resolveShowImagesSetting,
 	sanitizeImagePromptForProvider,
 	shouldRetryWithFallbackVisionProvider,
 	supportsNativeImageInput,
@@ -137,6 +139,8 @@ Always start your response with:
 
 Then provide your detailed analysis.`;
 
+const REFERENCED_IMAGES_MESSAGE_TYPE = "referenced-images";
+
 function mimeTypeForImagePath(path: string): ImageContent["mimeType"] | undefined {
 	const ext = path.split(".").pop()?.toLowerCase();
 	switch (ext) {
@@ -183,6 +187,47 @@ async function loadImageAttachment(cwd: string, inputPath: string): Promise<Imag
 
 	const data = (await readFile(absolutePath)).toString("base64");
 	return { type: "image", data, mimeType };
+}
+
+interface ReferencedImagePreviewItem {
+	path: string;
+	data: string;
+	mimeType: ImageContent["mimeType"];
+}
+
+interface ReferencedImagePreviewDetails {
+	showImages: boolean;
+	images: ReferencedImagePreviewItem[];
+}
+
+async function readJsonFileIfExists(path: string): Promise<unknown | undefined> {
+	try {
+		return JSON.parse(await readFile(path, "utf-8"));
+	} catch {
+		return undefined;
+	}
+}
+
+async function getShowImagesSetting(cwd: string): Promise<boolean> {
+	const [globalSettings, projectSettings] = await Promise.all([
+		readJsonFileIfExists(join(homedir(), ".pi", "agent", "settings.json")),
+		readJsonFileIfExists(join(cwd, ".pi", "settings.json")),
+	]);
+	return resolveShowImagesSetting(globalSettings, projectSettings);
+}
+
+async function loadReferencedImagePreviews(cwd: string, text: string): Promise<ReferencedImagePreviewItem[]> {
+	const previews: ReferencedImagePreviewItem[] = [];
+
+	for (const imagePath of findExplicitImagePaths(text)) {
+		const loaded = await loadImageAttachment(cwd, imagePath);
+		if (!loaded) {
+			continue;
+		}
+		previews.push({ path: resolveUserPath(cwd, imagePath), data: loaded.data, mimeType: loaded.mimeType });
+	}
+
+	return previews;
 }
 
 interface AnalyzeImageOptions {
@@ -542,6 +587,32 @@ export default function (pi: ExtensionAPI) {
 	const localRead = createReadTool(process.cwd());
 	let explicitMediaAnalysisPaths = new Set<string>();
 
+	pi.registerMessageRenderer<ReferencedImagePreviewDetails>(
+		REFERENCED_IMAGES_MESSAGE_TYPE,
+		(message, _options, theme) => {
+			const details = message.details;
+			if (!details || !Array.isArray(details.images) || details.images.length === 0 || !details.showImages) {
+				return undefined;
+			}
+
+			const container = new Container();
+			for (const [index, image] of details.images.entries()) {
+				container.addChild(
+					new Image(
+						image.data,
+						image.mimeType,
+						{ fallbackColor: (text: string) => theme.fg("customMessageText", text) },
+						{ maxWidthCells: 60 },
+					),
+				);
+				if (index < details.images.length - 1) {
+					container.addChild(new Spacer(1));
+				}
+			}
+			return container;
+		},
+	);
+
 	pi.on("turn_end", () => {
 		explicitMediaAnalysisPaths = new Set<string>();
 	});
@@ -555,24 +626,16 @@ export default function (pi: ExtensionAPI) {
 			return { action: "continue" };
 		}
 
-		const matches = findImageReferences(event.text);
-		if (matches.length === 0) {
+		const explicitImagePaths = findExplicitImagePaths(event.text);
+		if (explicitImagePaths.length === 0) {
 			return { action: "continue" };
 		}
 
 		const attachments = [...(event.images ?? [])];
 		let changed = false;
 
-		for (const match of matches) {
-			if (match.kind !== "path") {
-				continue;
-			}
-			const explicitPath = match.fullMatch.slice(match.prefix.length).startsWith("@");
-			if (!explicitPath) {
-				continue;
-			}
-
-			const loaded = await loadImageAttachment(ctx.cwd, match.path);
+		for (const imagePath of explicitImagePaths) {
+			const loaded = await loadImageAttachment(ctx.cwd, imagePath);
 			if (!loaded) {
 				continue;
 			}
@@ -592,13 +655,43 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("context", (event, ctx) => {
-		if (!supportsNativeImageInput(ctx.model?.input)) {
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (!ctx.hasUI) {
 			return undefined;
 		}
 
-		const messages = structuredClone(event.messages);
-		let changed = false;
+		const showImages = await getShowImagesSetting(ctx.cwd);
+		if (!showImages) {
+			return undefined;
+		}
+
+		const images = await loadReferencedImagePreviews(ctx.cwd, event.prompt);
+		if (images.length === 0) {
+			return undefined;
+		}
+
+		return {
+			message: {
+				customType: REFERENCED_IMAGES_MESSAGE_TYPE,
+				content: "",
+				display: true,
+				details: {
+					showImages,
+					images,
+				},
+			},
+		};
+	});
+
+	pi.on("context", (event, ctx) => {
+		const messages = structuredClone(event.messages).filter(
+			(message) => message.role !== "custom" || message.customType !== REFERENCED_IMAGES_MESSAGE_TYPE,
+		);
+		let changed = messages.length !== event.messages.length;
+
+		if (!supportsNativeImageInput(ctx.model?.input)) {
+			return changed ? { messages } : undefined;
+		}
 
 		for (const message of messages) {
 			if (message.role !== "user") {

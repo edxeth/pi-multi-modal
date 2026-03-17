@@ -190,6 +190,13 @@ export function findExplicitMediaPaths(text: string): string[] {
 	return matches;
 }
 
+export function findExplicitImagePaths(text: string): string[] {
+	return findImageReferences(text)
+		.filter((match): match is Extract<ImageReferenceMatch, { kind: "path" }> => match.kind === "path")
+		.filter((match) => match.fullMatch.slice(match.prefix.length).startsWith("@"))
+		.map((match) => match.path);
+}
+
 /**
  * Replace inline local image paths with stable placeholders like [Image #1].
  * Replacement happens in match order and preserves surrounding punctuation/spacing.
@@ -290,6 +297,25 @@ export function sanitizeImagePromptForProvider(text: string): string {
 		.replaceAll(COLOR_RESET, "")
 		.replace(IMAGE_REFERENCE_SUFFIX_REGEX, "")
 		.trimEnd();
+}
+
+function readBooleanSetting(settings: unknown, path: readonly string[]): boolean | undefined {
+	let current: unknown = settings;
+	for (const key of path) {
+		if (current === null || typeof current !== "object" || !(key in current)) {
+			return undefined;
+		}
+		current = (current as Record<string, unknown>)[key];
+	}
+	return typeof current === "boolean" ? current : undefined;
+}
+
+export function resolveShowImagesSetting(globalSettings: unknown, projectSettings: unknown): boolean {
+	return (
+		readBooleanSetting(projectSettings, ["terminal", "showImages"]) ??
+		readBooleanSetting(globalSettings, ["terminal", "showImages"]) ??
+		true
+	);
 }
 
 /**
