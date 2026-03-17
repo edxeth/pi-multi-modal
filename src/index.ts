@@ -6,14 +6,16 @@
  * glm-4.6v for non-vision read requests.
  */
 
-import { spawn } from "node:child_process";
-import { access, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
-import { homedir } from "node:os";
+import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { access, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ImageContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { BorderedLoader, createReadTool } from "@mariozechner/pi-coding-agent";
 import { Container, Image, Spacer } from "@mariozechner/pi-tui";
+import { extensionForImageMimeType, readClipboardImage } from "./clipboard-image.js";
 import {
 	extractTextFromPiOutput,
 	findExplicitImagePaths,
@@ -583,9 +585,182 @@ async function analyzeVideo({ absolutePath, preferredProvider, signal }: Analyze
 	}
 }
 
+const WINDOWS_POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+const MAX_CLIPBOARD_TEXT_BYTES = 5 * 1024 * 1024;
+
+function setWeztermUserVar(name: string, value: string): void {
+	if (!process.stdout.isTTY || process.env.TERM_PROGRAM !== "WezTerm") {
+		return;
+	}
+
+	const encoded = Buffer.from(value, "utf-8").toString("base64");
+	process.stdout.write(`\u001b]1337;SetUserVar=${name}=${encoded}\u0007`);
+}
+
+function clipboardHasImageHint(): boolean {
+	const hasImage = (text: string) =>
+		text
+			.split(/\r?\n/)
+			.map((line) => line.trim().toLowerCase().split(";")[0])
+			.some((line) => line.startsWith("image/"));
+
+	if (process.env.WAYLAND_DISPLAY) {
+		const result = spawnSync("wl-paste", ["--list-types"], { timeout: 1000, maxBuffer: 64 * 1024 });
+		if (!result.error && result.status === 0 && hasImage(result.stdout?.toString("utf-8") ?? "")) {
+			return true;
+		}
+	}
+
+	if (process.env.DISPLAY) {
+		const result = spawnSync("xclip", ["-selection", "clipboard", "-t", "TARGETS", "-o"], {
+			timeout: 1000,
+			maxBuffer: 64 * 1024,
+		});
+		if (!result.error && result.status === 0 && hasImage(result.stdout?.toString("utf-8") ?? "")) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+function readClipboardText(): string | null {
+	const normalize = (text: string) => text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+	const fromResult = (result: ReturnType<typeof spawnSync>): string | null => {
+		if (result.error || result.status !== 0) {
+			return null;
+		}
+		const text = normalize(result.stdout?.toString("utf-8") ?? "");
+		return text.length > 0 ? text : null;
+	};
+
+	if (process.env.WAYLAND_DISPLAY) {
+		const text = fromResult(
+			spawnSync("wl-paste", ["--no-newline"], { timeout: 1000, maxBuffer: MAX_CLIPBOARD_TEXT_BYTES }),
+		);
+		if (text) {
+			return text;
+		}
+	}
+
+	if (process.env.DISPLAY) {
+		const text = fromResult(
+			spawnSync("xclip", ["-selection", "clipboard", "-o"], {
+				timeout: 1000,
+				maxBuffer: MAX_CLIPBOARD_TEXT_BYTES,
+			}),
+		);
+		if (text) {
+			return text;
+		}
+	}
+
+	if (process.env.WSL_INTEROP) {
+		return fromResult(
+			spawnSync(
+				WINDOWS_POWERSHELL,
+				[
+					"-NoLogo",
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					'[Console]::Out.Write((Get-Clipboard -Raw).ToString().Replace("`r", ""))',
+				],
+				{ timeout: 3000, maxBuffer: MAX_CLIPBOARD_TEXT_BYTES },
+			),
+		);
+	}
+
+	return null;
+}
+
+async function pasteClipboardIntoEditor(
+	ctx: Parameters<NonNullable<ExtensionAPI["registerShortcut"]>>[1]["handler"] extends (ctx: infer T) => unknown
+		? T
+		: never,
+): Promise<boolean> {
+	const ui = ctx.ui as typeof ctx.ui & { pasteToEditor?: (text: string) => void };
+	const forceRender = () => ui.setWidget("__smart_paste_render", undefined);
+	const paste = (text: string) => {
+		if (typeof ui.pasteToEditor === "function") {
+			ui.pasteToEditor(text);
+		} else {
+			ui.setEditorText(ui.getEditorText() + text);
+		}
+		forceRender();
+	};
+	const hasImageHint = clipboardHasImageHint();
+
+	if (hasImageHint) {
+		const image = await readClipboardImage();
+		if (image) {
+			const ext = extensionForImageMimeType(image.mimeType) ?? "png";
+			const filePath = join(tmpdir(), `pi-clipboard-${randomUUID()}.${ext}`);
+			await writeFile(filePath, image.bytes);
+			paste(`@${filePath}`);
+			return true;
+		}
+	}
+
+	const text = readClipboardText();
+	if (text) {
+		paste(text);
+		return true;
+	}
+
+	if (!hasImageHint) {
+		const image = await readClipboardImage();
+		if (image) {
+			const ext = extensionForImageMimeType(image.mimeType) ?? "png";
+			const filePath = join(tmpdir(), `pi-clipboard-${randomUUID()}.${ext}`);
+			await writeFile(filePath, image.bytes);
+			paste(`@${filePath}`);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 export default function (pi: ExtensionAPI) {
 	const localRead = createReadTool(process.cwd());
 	let explicitMediaAnalysisPaths = new Set<string>();
+
+	const handleSmartPaste = async (
+		ctx: Parameters<NonNullable<ExtensionAPI["registerShortcut"]>>[1]["handler"] extends (ctx: infer T) => unknown
+			? T
+			: never,
+	) => {
+		if (!ctx.hasUI) {
+			return;
+		}
+		const pasted = await pasteClipboardIntoEditor(ctx);
+		if (!pasted) {
+			ctx.ui.notify("Clipboard is empty or unsupported", "warning");
+		}
+	};
+
+	pi.registerShortcut("ctrl+shift+v", {
+		description: "Smart paste image or text from clipboard",
+		handler: handleSmartPaste,
+	});
+
+	pi.registerShortcut("f11", {
+		description: "Internal smart paste dispatch",
+		handler: handleSmartPaste,
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		if (ctx.hasUI) {
+			setWeztermUserVar("PI_SMART_PASTE", "1");
+		}
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (ctx.hasUI) {
+			setWeztermUserVar("PI_SMART_PASTE", "0");
+		}
+	});
 
 	pi.registerMessageRenderer<ReferencedImagePreviewDetails>(
 		REFERENCED_IMAGES_MESSAGE_TYPE,
