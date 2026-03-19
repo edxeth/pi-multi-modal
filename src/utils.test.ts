@@ -12,6 +12,7 @@ import {
 	isImageFile,
 	isVideoFile,
 	needsVisionProxy,
+	parseBashImageOutput,
 	pickPreferredVisionProvider,
 	replaceExplicitInlineImagePathsWithPlaceholders,
 	replaceInlineImagePathsWithPlaceholders,
@@ -147,6 +148,36 @@ describe("supportsNativeImageInput", () => {
 	it("returns false for text-only or undefined models", () => {
 		expect(supportsNativeImageInput(["text"])).toBe(false);
 		expect(supportsNativeImageInput(undefined)).toBe(false);
+	});
+});
+
+describe("bash image marker parsing", () => {
+	it("splits text and inline image markers in order", () => {
+		expect(parseBashImageOutput("Saved\n__PI_IMAGE_MARKER__:/tmp/a.png\nDone")).toEqual({
+			foundMarkers: true,
+			parts: [
+				{ type: "text", text: "Saved" },
+				{ type: "image-marker", path: "/tmp/a.png" },
+				{ type: "text", text: "Done" },
+			],
+		});
+	});
+
+	it("preserves plain text when no markers exist", () => {
+		expect(parseBashImageOutput("No image here")).toEqual({
+			foundMarkers: false,
+			parts: [{ type: "text", text: "No image here" }],
+		});
+	});
+
+	it("ignores empty marker payloads", () => {
+		expect(parseBashImageOutput("Start\n__PI_IMAGE_MARKER__:   \nEnd")).toEqual({
+			foundMarkers: true,
+			parts: [
+				{ type: "text", text: "Start" },
+				{ type: "text", text: "End" },
+			],
+		});
 	});
 });
 

@@ -17,6 +17,7 @@ const INLINE_IMAGE_PATH_REGEX = /(^|\s|\(|:|\[)(@?((?:~|\/|\.\.?\/)[^\s)\]}"']+\
 const INLINE_EXPLICIT_MEDIA_PATH_REGEX = /(^|\s|\(|:|\[)(@((?:~|\/|\.\.?\/)[^\s)\]}"']+\.[a-z0-9]+))/gim;
 const VISION_PROVIDER_RETRYABLE_ERROR_REGEX =
 	/no api key found|unknown provider|no models matching|no models available|unknown model/i;
+export const PI_BASH_IMAGE_MARKER_PREFIX = "__PI_IMAGE_MARKER__:";
 let resolvedVisionProviderPromise: Promise<string> | undefined;
 
 export type ImageReferenceMatch =
@@ -49,6 +50,16 @@ export interface PiContentBlock {
 export interface PiJsonOutput {
 	messages?: PiMessage[];
 }
+
+export type BashImageOutputPart =
+	| {
+			type: "text";
+			text: string;
+	  }
+	| {
+			type: "image-marker";
+			path: string;
+	  };
 
 function escapeRegExp(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -120,6 +131,40 @@ export async function resolveVisionProvider(): Promise<string> {
 		pickPreferredVisionProvider(providers),
 	);
 	return resolvedVisionProviderPromise;
+}
+
+export function parseBashImageOutput(text: string): { parts: BashImageOutputPart[]; foundMarkers: boolean } {
+	const lines = text.split("\n");
+	const parts: BashImageOutputPart[] = [];
+	const textLines: string[] = [];
+	let foundMarkers = false;
+
+	const flushText = () => {
+		if (textLines.length === 0) {
+			return;
+		}
+		parts.push({ type: "text", text: textLines.join("\n") });
+		textLines.length = 0;
+	};
+
+	for (const line of lines) {
+		if (!line.startsWith(PI_BASH_IMAGE_MARKER_PREFIX)) {
+			textLines.push(line);
+			continue;
+		}
+
+		foundMarkers = true;
+		flushText();
+
+		const path = line.slice(PI_BASH_IMAGE_MARKER_PREFIX.length).trim();
+		if (!path) {
+			continue;
+		}
+		parts.push({ type: "image-marker", path });
+	}
+
+	flushText();
+	return { parts, foundMarkers };
 }
 
 /**

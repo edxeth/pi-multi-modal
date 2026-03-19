@@ -2,10 +2,11 @@
 
 A [pi](https://github.com/badlogic/pi-mono) extension for local media paths.
 
-It does two different jobs depending on the active model:
+It does three jobs depending on the active model and workflow:
 
 - **Models with native image input**: explicit `@./image.png` paths are attached as real image inputs.
 - **Models without native image input**: explicit `@./image.png`, `@./video.mp4`, or `@./file.pdf` paths opt into GLM-based media analysis when the agent reads that same file.
+- **Bash image workflows**: the bash tool gets a built-in `__PI_IMAGE__` helper so any command that creates a local image file can return it inline in the same tool result.
 
 ## Behavior
 
@@ -47,6 +48,23 @@ Add ./preview-1.png and ./preview-2.png to my README
 List all image paths mentioned in this document
 ```
 
+### 3) Inline bash images
+
+The extension injects a `__PI_IMAGE__` shell helper into the bash tool.
+
+```bash
+python make-chart.py && __PI_IMAGE__ chart.png
+my-tool-that-generates-an-image && __PI_IMAGE__ output.png
+```
+
+`agent-browser` is just one example of this pattern.
+
+What happens:
+- the helper emits markers for real local image paths
+- pi-multi-modal replaces those markers before the model sees the tool result
+- vision models receive the actual image block inline
+- non-vision models receive an inline `glm-4.6v` image analysis instead
+
 ## Vision backend
 
 Media proxy analysis uses:
@@ -60,6 +78,7 @@ Provider selection is resolved from the current pi instance without the slow `pi
 
 - explicit `@path` handling for native image-input models
 - explicit opt-in media analysis for non-vision models
+- inline bash image ingestion via `__PI_IMAGE__`
 - image classification for screenshots, diagrams, charts, and general images
 - video analysis via local keyframe extraction with `ffmpeg`
 - PDF analysis via rendered page images
@@ -108,6 +127,15 @@ Analyze @./screenshot.png and explain the error
 ```
 
 If the agent reads `./screenshot.png`, the extension routes that read through `glm-4.6v`.
+
+`agent-browser` example in one bash result:
+
+```bash
+agent-browser open https://example.com \
+  && agent-browser wait --load networkidle \
+  && agent-browser screenshot page.png \
+  && __PI_IMAGE__ page.png
+```
 
 ## Supported formats
 

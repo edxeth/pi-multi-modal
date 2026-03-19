@@ -13,7 +13,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ImageContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { BorderedLoader, createReadTool } from "@mariozechner/pi-coding-agent";
+import { BorderedLoader, createBashTool, createReadTool } from "@mariozechner/pi-coding-agent";
 import { Container, Image, Spacer } from "@mariozechner/pi-tui";
 import { extensionForImageMimeType, readClipboardImage } from "./clipboard-image.js";
 import {
@@ -25,6 +25,8 @@ import {
 	isPdfFile,
 	isVideoFile,
 	needsVisionProxy,
+	PI_BASH_IMAGE_MARKER_PREFIX,
+	parseBashImageOutput,
 	pickPreferredVisionProvider,
 	replaceExplicitInlineImagePathsWithPlaceholders,
 	resolveShowImagesSetting,
@@ -142,6 +144,25 @@ Always start your response with:
 Then provide your detailed analysis.`;
 
 const REFERENCED_IMAGES_MESSAGE_TYPE = "referenced-images";
+const BASH_IMAGE_GUIDELINE =
+	"The bash environment has a built-in `__PI_IMAGE__` helper. Use it with screenshot-producing CLIs like `agent-browser` to include image output in the same bash result. Append `&& __PI_IMAGE__ <path>` to your command, or pipe text into it with `| __PI_IMAGE__ <path>`.";
+const BASH_IMAGE_PREAMBLE = [
+	`__PI_IMAGE__() {`,
+	`  if [ -p /dev/stdin ]; then cat; printf '\n'; fi`,
+	`  for f in "$@"; do`,
+	`    _pi_image_path=$(realpath "$f" 2>/dev/null)`,
+	`    if [ -n "$_pi_image_path" ] && [ -f "$_pi_image_path" ]; then`,
+	`      echo "${PI_BASH_IMAGE_MARKER_PREFIX}$_pi_image_path"`,
+	`    else`,
+	`      echo "[__PI_IMAGE__: file not found: $f]" >&2`,
+	`    fi`,
+	`  done`,
+	`}`,
+].join("\n");
+
+type ToolTextBlock = { type: "text"; text: string };
+type ToolContentBlock = ToolTextBlock | ImageContent;
+type ToolResult = { content: ToolContentBlock[]; details: Record<string, never> };
 
 function mimeTypeForImagePath(path: string): ImageContent["mimeType"] | undefined {
 	const ext = path.split(".").pop()?.toLowerCase();
@@ -230,6 +251,60 @@ async function loadReferencedImagePreviews(cwd: string, text: string): Promise<R
 	}
 
 	return previews;
+}
+
+function createVisionAnalysisResult(label: string, summaryText: string): ToolResult {
+	return {
+		content: [{ type: "text", text: `[${label} analyzed with ${VISION_MODEL}]\n\n${summaryText}` }],
+		details: {},
+	};
+}
+
+async function analyzeMediaToolResult(
+	absolutePath: string,
+	options: {
+		image: boolean;
+		video: boolean;
+		pdf: boolean;
+		preferredProvider: string;
+		signal?: AbortSignal;
+		onUpdate?: (result: ToolResult) => void;
+	},
+): Promise<ToolResult> {
+	const { video, pdf, preferredProvider, signal, onUpdate } = options;
+	const mediaType = video ? "video" : pdf ? "PDF" : "image";
+	onUpdate?.({
+		content: [
+			{
+				type: "text",
+				text: video
+					? `[Extracting keyframes and analyzing video with ${VISION_MODEL}...]`
+					: pdf
+						? `[Analyzing PDF with ${VISION_MODEL}...]`
+						: `[Analyzing image with ${VISION_MODEL}...]`,
+			},
+		],
+		details: {},
+	});
+
+	try {
+		const summaryText = video
+			? await analyzeVideo({ absolutePath, preferredProvider, signal })
+			: pdf
+				? await analyzePdf({ absolutePath, preferredProvider, signal })
+				: await analyzeImage({ absolutePath, preferredProvider, signal });
+
+		if (signal?.aborted) {
+			throw new Error("Operation aborted");
+		}
+
+		const result = createVisionAnalysisResult(video ? "Video" : pdf ? "PDF" : "Image", summaryText);
+		onUpdate?.(result);
+		return result;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`${mediaType[0].toUpperCase()}${mediaType.slice(1)} analysis failed: ${message}`);
+	}
 }
 
 interface AnalyzeImageOptions {
@@ -722,8 +797,94 @@ async function pasteClipboardIntoEditor(
 	return false;
 }
 
+async function resolveInlineBashImageContent(
+	path: string,
+	options: {
+		localRead: ReturnType<typeof createReadTool>;
+		ctx: Parameters<ExtensionAPI["on"]>[1] extends (event: never, ctx: infer T) => unknown ? T : never;
+		signal?: AbortSignal;
+	},
+): Promise<ToolContentBlock[] | { error: string }> {
+	const { localRead, ctx, signal } = options;
+	const absolutePath = resolveUserPath(ctx.cwd, path);
+	if (!isImageFile(absolutePath)) {
+		return { error: `not a supported image (png/jpg/gif/webp): ${path}` };
+	}
+
+	if (needsVisionProxy(ctx.model?.input)) {
+		const preferredProvider = resolvePreferredVisionProvider(ctx.modelRegistry);
+		const result = await analyzeMediaToolResult(absolutePath, {
+			image: true,
+			video: false,
+			pdf: false,
+			preferredProvider,
+			signal,
+		});
+		return result.content;
+	}
+
+	const result = await localRead.execute("__pi_image__", { path: absolutePath }, signal);
+	const hasImage = result.content.some((block): block is ImageContent => block.type === "image");
+	if (!hasImage) {
+		return { error: `not a supported image (png/jpg/gif/webp): ${path}` };
+	}
+	return result.content as ToolContentBlock[];
+}
+
+async function processBashResult(
+	result: { content: ToolContentBlock[]; details?: unknown },
+	options: {
+		localRead: ReturnType<typeof createReadTool>;
+		ctx: Parameters<ExtensionAPI["on"]>[1] extends (event: never, ctx: infer T) => unknown ? T : never;
+		signal?: AbortSignal;
+	},
+): Promise<{ content: ToolContentBlock[]; details?: unknown; foundMarkers: boolean }> {
+	const content: ToolContentBlock[] = [];
+	let foundMarkers = false;
+
+	for (const block of result.content) {
+		if (block.type !== "text") {
+			content.push(block);
+			continue;
+		}
+
+		const parsed = parseBashImageOutput(block.text ?? "");
+		foundMarkers ||= parsed.foundMarkers;
+
+		for (const part of parsed.parts) {
+			if (part.type === "text") {
+				content.push(part);
+				continue;
+			}
+
+			try {
+				const resolved = await resolveInlineBashImageContent(part.path, options);
+				if ("error" in resolved) {
+					content.push({ type: "text", text: `[__PI_IMAGE__: ${resolved.error}]` });
+				} else {
+					content.push(...resolved);
+				}
+			} catch (error) {
+				content.push({
+					type: "text",
+					text: `[__PI_IMAGE__: ${error instanceof Error ? error.message : String(error)}]`,
+				});
+			}
+		}
+	}
+
+	return { content, details: result.details, foundMarkers };
+}
+
 export default function (pi: ExtensionAPI) {
 	const localRead = createReadTool(process.cwd());
+	const localBash = createBashTool(process.cwd(), {
+		spawnHook: ({ command, cwd, env }) => ({
+			command: `${BASH_IMAGE_PREAMBLE}\n${command}`,
+			cwd,
+			env,
+		}),
+	});
 	let explicitMediaAnalysisPaths = new Set<string>();
 
 	const handleSmartPaste = async (
@@ -787,6 +948,23 @@ export default function (pi: ExtensionAPI) {
 			return container;
 		},
 	);
+
+	pi.registerTool({
+		...localBash,
+		description: `${localBash.description} ${BASH_IMAGE_GUIDELINE}`,
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const result = await localBash.execute(toolCallId, params, signal, onUpdate);
+			const processed = await processBashResult(result as { content: ToolContentBlock[]; details?: unknown }, {
+				localRead,
+				ctx,
+				signal,
+			});
+			if (!processed.foundMarkers) {
+				return result;
+			}
+			return { content: processed.content, details: processed.details };
+		},
+	});
 
 	pi.on("turn_end", () => {
 		explicitMediaAnalysisPaths = new Set<string>();
@@ -931,45 +1109,15 @@ export default function (pi: ExtensionAPI) {
 				return localRead.execute(toolCallId, params, signal, onUpdate);
 			}
 
-			const mediaType = video ? "video" : pdf ? "PDF" : "image";
-			onUpdate?.({
-				content: [
-					{
-						type: "text",
-						text: video
-							? `[Extracting keyframes and analyzing video with ${VISION_MODEL}...]`
-							: pdf
-								? `[Analyzing PDF with ${VISION_MODEL}...]`
-								: `[Analyzing image with ${VISION_MODEL}...]`,
-					},
-				],
-				details: {},
+			const preferredProvider = resolvePreferredVisionProvider(ctx.modelRegistry);
+			return analyzeMediaToolResult(absolutePath, {
+				image,
+				video,
+				pdf,
+				preferredProvider,
+				signal,
+				onUpdate,
 			});
-
-			try {
-				const preferredProvider = resolvePreferredVisionProvider(ctx.modelRegistry);
-				const summaryText = video
-					? await analyzeVideo({ absolutePath, preferredProvider, signal })
-					: pdf
-						? await analyzePdf({ absolutePath, preferredProvider, signal })
-						: await analyzeImage({ absolutePath, preferredProvider, signal });
-
-				if (signal?.aborted) {
-					throw new Error("Operation aborted");
-				}
-
-				const label = video ? "Video" : pdf ? "PDF" : "Image";
-				const result = {
-					content: [{ type: "text" as const, text: `[${label} analyzed with ${VISION_MODEL}]\n\n${summaryText}` }],
-					details: {},
-				};
-
-				onUpdate?.(result);
-				return result;
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				throw new Error(`${mediaType[0].toUpperCase()}${mediaType.slice(1)} analysis failed: ${message}`);
-			}
 		},
 	});
 
