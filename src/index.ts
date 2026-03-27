@@ -664,12 +664,24 @@ const WINDOWS_POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/power
 const MAX_CLIPBOARD_TEXT_BYTES = 5 * 1024 * 1024;
 
 function setWeztermUserVar(name: string, value: string): void {
-	if (!process.stdout.isTTY || process.env.TERM_PROGRAM !== "WezTerm") {
+	if (!process.stdout.isTTY) {
 		return;
 	}
 
 	const encoded = Buffer.from(value, "utf-8").toString("base64");
-	process.stdout.write(`\u001b]1337;SetUserVar=${name}=${encoded}\u0007`);
+	const sequence = `\u001b]1337;SetUserVar=${name}=${encoded}\u0007`;
+	if (process.env.TMUX) {
+		process.stdout.write(`\u001bPtmux;${sequence.replace(/\u001b/g, "\u001b\u001b")}\u001b\\`);
+		return;
+	}
+
+	const isWezTerm =
+		process.env.TERM_PROGRAM === "WezTerm" || Boolean(process.env.WEZTERM_PANE) || Boolean(process.env.WEZTERM_EXECUTABLE);
+	if (!isWezTerm) {
+		return;
+	}
+
+	process.stdout.write(sequence);
 }
 
 function clipboardHasImageHint(): boolean {
