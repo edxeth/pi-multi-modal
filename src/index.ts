@@ -9,13 +9,15 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { access, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { ImageContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { BorderedLoader, createBashTool, createReadTool } from "@mariozechner/pi-coding-agent";
-import { Container, Image, Spacer } from "@mariozechner/pi-tui";
 import { extensionForImageMimeType, readClipboardImage } from "./clipboard-image.js";
+import { ImageGallery, type GalleryImage } from "./image-gallery.js";
 import {
 	extractTextFromPiOutput,
 	findExplicitImagePaths,
@@ -163,6 +165,59 @@ const BASH_IMAGE_PREAMBLE = [
 type ToolTextBlock = { type: "text"; text: string };
 type ToolContentBlock = ToolTextBlock | ImageContent;
 type ToolResult = { content: ToolContentBlock[]; details: Record<string, never> };
+type PreviewTrackedImage = { filePath: string; image: ImageContent; label: string };
+type ImageResizer = (image: ImageContent) => Promise<ImageContent>;
+type PreviewCtx = {
+	cwd: string;
+	ui: {
+		setWidget: (key: string, content: string[] | ((tui: unknown, theme: { fg: (color: string, value: string) => string; bold: (value: string) => string }) => unknown) | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }) => void;
+		getEditorText: () => string;
+		theme: { fg: (color: string, value: string) => string; bold: (value: string) => string };
+	};
+};
+
+const IMAGE_PREVIEW_WIDGET_KEY = "multi-modal-image-preview";
+const IMAGE_PREVIEW_POLL_MS = 250;
+let cachedPreviewResizerPromise: Promise<ImageResizer | null> | undefined;
+
+async function loadPiImageResizer(): Promise<ImageResizer | null> {
+	if (cachedPreviewResizerPromise) return cachedPreviewResizerPromise;
+
+	cachedPreviewResizerPromise = (async () => {
+		try {
+			const require = createRequire(import.meta.url);
+			const piEntry = require.resolve("@mariozechner/pi-coding-agent");
+			const distDir = dirname(piEntry);
+			const moduleUrl = pathToFileURL(join(distDir, "utils", "image-resize.js")).href;
+			const mod = (await import(moduleUrl)) as {
+				resizeImage?: (image: { type: "image"; data: string; mimeType: string }) => Promise<{ data: string; mimeType: string }>;
+			};
+			if (!mod.resizeImage) return null;
+			return async (image) => {
+				const resized = await mod.resizeImage!(image);
+				return {
+					type: "image",
+					data: resized.data,
+					mimeType: resized.mimeType,
+				};
+			};
+		} catch {
+			return null;
+		}
+	})();
+
+	return cachedPreviewResizerPromise;
+}
+
+async function maybeResizePreviewImage(image: ImageContent): Promise<ImageContent> {
+	const resizeImage = await loadPiImageResizer();
+	if (!resizeImage) return image;
+	try {
+		return await resizeImage(image);
+	} catch {
+		return image;
+	}
+}
 
 function mimeTypeForImagePath(path: string): ImageContent["mimeType"] | undefined {
 	const ext = path.split(".").pop()?.toLowerCase();
@@ -247,10 +302,118 @@ async function loadReferencedImagePreviews(cwd: string, text: string): Promise<R
 		if (!loaded) {
 			continue;
 		}
-		previews.push({ path: resolveUserPath(cwd, imagePath), data: loaded.data, mimeType: loaded.mimeType });
+		const preview = await maybeResizePreviewImage(loaded);
+		previews.push({ path: resolveUserPath(cwd, imagePath), data: preview.data, mimeType: preview.mimeType });
 	}
 
 	return previews;
+}
+
+function createPreviewController() {
+	let tracked = new Map<string, PreviewTrackedImage>();
+	let gallery: ImageGallery | null = null;
+	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	let latestCtx: PreviewCtx | null = null;
+
+	function refreshWidget(): void {
+		if (!latestCtx) return;
+		if (tracked.size === 0) {
+			gallery?.dispose();
+			gallery = null;
+			latestCtx.ui.setWidget(IMAGE_PREVIEW_WIDGET_KEY, undefined);
+			return;
+		}
+
+		const galleryImages: GalleryImage[] = [...tracked.values()].map((entry) => ({
+			data: entry.image.data,
+			mimeType: entry.image.mimeType,
+			label: entry.label,
+		}));
+
+		gallery?.dispose();
+		gallery = null;
+		latestCtx.ui.setWidget(
+			IMAGE_PREVIEW_WIDGET_KEY,
+			(_tui, theme) => {
+				gallery = new ImageGallery({
+					accent: (value) => theme.fg("accent", value),
+					muted: (value) => theme.fg("muted", value),
+					dim: (value) => theme.fg("dim", value),
+					bold: (value) => theme.bold(value),
+				});
+				gallery.setImages(galleryImages);
+				return gallery;
+			},
+			{ placement: "aboveEditor" },
+		);
+	}
+
+	function resetWidget(ctx?: PreviewCtx | null): void {
+		if (ctx) latestCtx = ctx;
+		gallery?.dispose();
+		gallery = null;
+		tracked = new Map();
+		latestCtx?.ui.setWidget(IMAGE_PREVIEW_WIDGET_KEY, undefined);
+	}
+
+	async function scanEditorText(): Promise<void> {
+		if (!latestCtx) return;
+		if (!(await getShowImagesSetting(latestCtx.cwd))) {
+			if (tracked.size > 0) resetWidget();
+			return;
+		}
+
+		const text = latestCtx.ui.getEditorText();
+		if (!text) {
+			if (tracked.size > 0) resetWidget();
+			return;
+		}
+
+		const currentPaths = new Set(findExplicitImagePaths(text));
+		let changed = false;
+
+		for (const imagePath of currentPaths) {
+			if (tracked.has(imagePath)) continue;
+			const loaded = await loadImageAttachment(latestCtx.cwd, imagePath);
+			if (!loaded) continue;
+			tracked.set(imagePath, {
+				filePath: imagePath,
+				image: await maybeResizePreviewImage(loaded),
+				label: basename(resolveUserPath(latestCtx.cwd, imagePath)),
+			});
+			changed = true;
+		}
+
+		for (const trackedPath of tracked.keys()) {
+			if (!currentPaths.has(trackedPath)) {
+				tracked.delete(trackedPath);
+				changed = true;
+			}
+		}
+
+		if (changed) refreshWidget();
+	}
+
+	return {
+		attach(ctx: PreviewCtx) {
+			latestCtx = ctx;
+			resetWidget(ctx);
+			if (pollTimer) clearInterval(pollTimer);
+			pollTimer = setInterval(() => {
+				void scanEditorText();
+			}, IMAGE_PREVIEW_POLL_MS);
+		},
+		reset(ctx?: PreviewCtx | null) {
+			resetWidget(ctx);
+		},
+		clear(ctx?: PreviewCtx | null) {
+			if (pollTimer) {
+				clearInterval(pollTimer);
+				pollTimer = null;
+			}
+			resetWidget(ctx);
+		},
+	};
 }
 
 function createVisionAnalysisResult(label: string, summaryText: string): ToolResult {
@@ -898,6 +1061,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 	});
 	let explicitMediaAnalysisPaths = new Set<string>();
+	const previewController = createPreviewController();
 
 	const handleSmartPaste = async (
 		ctx: Parameters<NonNullable<ExtensionAPI["registerShortcut"]>>[1]["handler"] extends (ctx: infer T) => unknown
@@ -926,12 +1090,20 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.hasUI) {
 			setWeztermUserVar("PI_SMART_PASTE", "1");
+			previewController.attach(ctx as PreviewCtx);
+		}
+	});
+
+	pi.on("session_switch", async (_event, ctx) => {
+		if (ctx.hasUI) {
+			previewController.attach(ctx as PreviewCtx);
 		}
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (ctx.hasUI) {
 			setWeztermUserVar("PI_SMART_PASTE", "0");
+			previewController.clear(ctx as PreviewCtx);
 		}
 	});
 
@@ -943,21 +1115,18 @@ export default function (pi: ExtensionAPI) {
 				return undefined;
 			}
 
-			const container = new Container();
-			for (const [index, image] of details.images.entries()) {
-				container.addChild(
-					new Image(
-						image.data,
-						image.mimeType,
-						{ fallbackColor: (text: string) => theme.fg("customMessageText", text) },
-						{ maxWidthCells: 60 },
-					),
-				);
-				if (index < details.images.length - 1) {
-					container.addChild(new Spacer(1));
-				}
-			}
-			return container;
+			const gallery = new ImageGallery({
+				accent: (value) => theme.fg("accent", value),
+				muted: (value) => theme.fg("muted", value),
+				dim: (value) => theme.fg("dim", value),
+				bold: (value) => theme.bold(value),
+			});
+			gallery.setImages(details.images.map((image) => ({
+				data: image.data,
+				mimeType: image.mimeType,
+				label: basename(image.path),
+			})));
+			return gallery;
 		},
 	);
 
@@ -986,6 +1155,9 @@ export default function (pi: ExtensionAPI) {
 		explicitMediaAnalysisPaths = new Set(
 			findExplicitMediaPaths(event.text).map((path) => resolveUserPath(ctx.cwd, path)),
 		);
+		if (ctx.hasUI) {
+			previewController.reset(ctx as PreviewCtx);
+		}
 
 		if (!supportsNativeImageInput(ctx.model?.input)) {
 			return { action: "continue" };
