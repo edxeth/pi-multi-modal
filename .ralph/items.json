@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "category": "functional",
+      "description": "WezTerm smart paste becomes a route-only dispatcher and no longer owns clipboard decoding, watcher state, or image staging for the standard flow.",
+      "steps": [
+        "Open a direct WezTerm WSL pane, a direct Neovim pane, and a direct PI pane.",
+        "Press Ctrl+Shift+V in each pane with representative clipboard contents.",
+        "Verify the active in-pane owner handles the paste instead of WezTerm materializing clipboard payloads itself."
+      ],
+      "passes": false,
+      "regression_notes": ""
+    },
+    {
+      "category": "functional",
+      "description": "Direct zsh shell smart paste handles both text and image clipboard payloads outside tmux using a single authoritative shell-owned implementation.",
+      "steps": [
+        "Open a direct zsh shell in WezTerm outside tmux.",
+        "Press Ctrl+Shift+V with text clipboard data and verify the text appears in the shell input buffer.",
+        "Press Ctrl+Shift+V with image clipboard data and verify a usable Linux path is inserted into the shell input buffer."
+      ],
+      "passes": true,
+      "regression_notes": ""
+    },
+    {
+      "category": "functional",
+      "description": "tmux zsh shell smart paste preserves the same shell-owned text and image behavior through minimal tmux metadata passthrough.",
+      "steps": [
+        "Open zsh inside tmux in WezTerm.",
+        "Press Ctrl+Shift+V with text clipboard data and verify the text appears in the shell input buffer.",
+        "Press Ctrl+Shift+V with image clipboard data and verify a usable Linux path is inserted into the shell input buffer."
+      ],
+      "passes": false,
+      "regression_notes": ""
+    },
+    {
+      "category": "functional",
+      "description": "Direct Neovim smart paste remains application-owned and reliably inserts text or image-path references outside tmux.",
+      "steps": [
+        "Open Neovim directly in WezTerm outside tmux.",
+        "Press Ctrl+Shift+V with text clipboard data and verify the text is inserted into the current buffer.",
+        "Press Ctrl+Shift+V with image clipboard data and verify an image path reference is inserted into the current buffer."
+      ],
+      "passes": false,
+      "regression_notes": ""
+    },
+    {
+      "category": "functional",
+      "description": "tmux Neovim smart paste remains application-owned and reliably inserts text or image-path references through tmux passthrough.",
+      "steps": [
+        "Open Neovim inside tmux in WezTerm.",
+        "Press Ctrl+Shift+V with text clipboard data and verify the text is inserted into the current buffer.",
+        "Press Ctrl+Shift+V with image clipboard data and verify an image path reference is inserted into the current buffer."
+      ],
+      "passes": false,
+      "regression_notes": ""
+    },
+    {
+      "category": "functional",
+      "description": "Direct PI smart paste remains application-owned and reliably inserts text or @path payloads outside tmux.",
+      "steps": [
+        "Open PI directly in WezTerm outside tmux.",
+        "Press Ctrl+Shift+V with text clipboard data and verify the text is inserted into the PI editor.",
+        "Press Ctrl+Shift+V with image clipboard data and verify an @path payload is inserted into the PI editor."
+      ],
+      "passes": false,
+      "regression_notes": ""
+    },
+    {
+      "category": "functional",
+      "description": "tmux PI smart paste remains application-owned and reliably inserts text or @path payloads through tmux passthrough.",
+      "steps": [
+        "Open PI inside tmux in WezTerm.",
+        "Press Ctrl+Shift+V with text clipboard data and verify the text is inserted into the PI editor.",
+        "Press Ctrl+Shift+V with image clipboard data and verify an @path payload is inserted into the PI editor."
+      ],
+      "passes": false,
+      "regression_notes": ""
+    },
+    {
+      "category": "verification",
+      "description": "A repo-tracked deterministic E2E verification harness proves the real 12-case smart-paste matrix against the Windows WezTerm + WSL environment.",
+      "steps": [
+        "Seed Windows clipboard text and image payloads from the verification environment.",
+        "Run the repo-tracked smart-paste E2E harness against direct shell, direct Neovim, direct PI, tmux shell, tmux Neovim, and tmux PI.",
+        "Verify the harness exits 0 and records proof for all 12 text/image cases without bypass."
+      ],
+      "passes": false,
+      "regression_notes": ""
+    }
+  ]
+}
