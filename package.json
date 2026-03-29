@@ -26,7 +26,8 @@
 		"check": "biome check . && tsc --noEmit",
 		"test": "vitest run",
 		"test:watch": "vitest",
-		"test:integration": "vitest run --config vitest.integration.config.ts"
+		"test:integration": "vitest run --config vitest.integration.config.ts",
+		"verify:smart-paste:direct-shell": "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify-smart-paste-direct-shell.ps1"
 	},
 	"pi": {
 		"extensions": [
