@@ -17,7 +17,7 @@ import type { ImageContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { BorderedLoader, createBashTool, createReadTool } from "@mariozechner/pi-coding-agent";
 import { extensionForImageMimeType, readClipboardImage } from "./clipboard-image.js";
-import { ImageGallery, type GalleryImage } from "./image-gallery.js";
+import { type GalleryImage, ImageGallery } from "./image-gallery.js";
 import {
 	extractTextFromPiOutput,
 	findExplicitImagePaths,
@@ -170,7 +170,17 @@ type ImageResizer = (image: ImageContent) => Promise<ImageContent>;
 type PreviewCtx = {
 	cwd: string;
 	ui: {
-		setWidget: (key: string, content: string[] | ((tui: unknown, theme: { fg: (color: string, value: string) => string; bold: (value: string) => string }) => unknown) | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }) => void;
+		setWidget: (
+			key: string,
+			content:
+				| string[]
+				| ((
+						tui: unknown,
+						theme: { fg: (color: string, value: string) => string; bold: (value: string) => string },
+				  ) => unknown)
+				| undefined,
+			options?: { placement?: "aboveEditor" | "belowEditor" },
+		) => void;
 		getEditorText: () => string;
 		theme: { fg: (color: string, value: string) => string; bold: (value: string) => string };
 	};
@@ -190,11 +200,16 @@ async function loadPiImageResizer(): Promise<ImageResizer | null> {
 			const distDir = dirname(piEntry);
 			const moduleUrl = pathToFileURL(join(distDir, "utils", "image-resize.js")).href;
 			const mod = (await import(moduleUrl)) as {
-				resizeImage?: (image: { type: "image"; data: string; mimeType: string }) => Promise<{ data: string; mimeType: string }>;
+				resizeImage?: (image: {
+					type: "image";
+					data: string;
+					mimeType: string;
+				}) => Promise<{ data: string; mimeType: string }>;
 			};
-			if (!mod.resizeImage) return null;
+			const resizeImage = mod.resizeImage;
+			if (!resizeImage) return null;
 			return async (image) => {
-				const resized = await mod.resizeImage!(image);
+				const resized = await resizeImage(image);
 				return {
 					type: "image",
 					data: resized.data,
@@ -834,12 +849,14 @@ function setWeztermUserVar(name: string, value: string): void {
 	const encoded = Buffer.from(value, "utf-8").toString("base64");
 	const sequence = `\u001b]1337;SetUserVar=${name}=${encoded}\u0007`;
 	if (process.env.TMUX) {
-		process.stdout.write(`\u001bPtmux;${sequence.replace(/\u001b/g, "\u001b\u001b")}\u001b\\`);
+		process.stdout.write(`\u001bPtmux;${sequence.split("\u001b").join("\u001b\u001b")}\u001b\\`);
 		return;
 	}
 
 	const isWezTerm =
-		process.env.TERM_PROGRAM === "WezTerm" || Boolean(process.env.WEZTERM_PANE) || Boolean(process.env.WEZTERM_EXECUTABLE);
+		process.env.TERM_PROGRAM === "WezTerm" ||
+		Boolean(process.env.WEZTERM_PANE) ||
+		Boolean(process.env.WEZTERM_EXECUTABLE);
 	if (!isWezTerm) {
 		return;
 	}
@@ -1121,11 +1138,13 @@ export default function (pi: ExtensionAPI) {
 				dim: (value) => theme.fg("dim", value),
 				bold: (value) => theme.bold(value),
 			});
-			gallery.setImages(details.images.map((image) => ({
-				data: image.data,
-				mimeType: image.mimeType,
-				label: basename(image.path),
-			})));
+			gallery.setImages(
+				details.images.map((image) => ({
+					data: image.data,
+					mimeType: image.mimeType,
+					label: basename(image.path),
+				})),
+			);
 			return gallery;
 		},
 	);
