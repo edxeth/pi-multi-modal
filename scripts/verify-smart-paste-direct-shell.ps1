@@ -1,7 +1,6 @@
 param(
   [string]$ResultPath = '',
-  [string]$CurrentPaneId = '',
-  [switch]$SkipAutoElevate
+  [string]$WezTermClass = 'RalphVerify'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,14 +13,6 @@ using System.Runtime.InteropServices;
 using System.Text;
 public static class RalphWeztermWin32 {
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-  [StructLayout(LayoutKind.Sequential)]
-  public struct RECT {
-    public int Left;
-    public int Top;
-    public int Right;
-    public int Bottom;
-  }
 
   [StructLayout(LayoutKind.Sequential)]
   public struct INPUT {
@@ -51,7 +42,6 @@ public static class RalphWeztermWin32 {
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
   [DllImport("user32.dll")] public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
@@ -65,16 +55,45 @@ public static class RalphWeztermWin32 {
 
 $wezterm = 'C:\Program Files\WezTerm\wezterm.exe'
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$wslStartCommand = 'wsl.exe -d Ubuntu --cd /home/devkit/.pi/agent/extensions/pi-multi-modal --exec zsh -i'
+$smartPasteLog = Join-Path $env:USERPROFILE 'smart-paste.log'
 $wslTextResult = '\\wsl.localhost\Ubuntu\tmp\ralph_direct_shell_text_result.txt'
 $wslImageResult = '\\wsl.localhost\Ubuntu\tmp\ralph_direct_shell_image_result.txt'
-$wslTextChecker = '/tmp/ralph_check_text.py'
-$wslImageChecker = '/tmp/ralph_check_image.py'
-$wslStartCommand = 'wsl.exe -d Ubuntu --cd /home/devkit/.pi/agent/extensions/pi-multi-modal --exec zsh -i'
-$currentPaneId = if ($CurrentPaneId) { $CurrentPaneId } else { $env:WEZTERM_PANE }
-$paneId = $null
+$textProofValue = 'direct-shell-text-proof'
 
 function Write-Progress([string]$message) {
   Write-Host "[verify:direct-shell] $message"
+}
+
+function Invoke-WezTermCli([string[]]$Args) {
+  $fullArgs = @('cli', '--no-auto-start', '--class', $WezTermClass) + $Args
+  $output = & $wezterm @fullArgs 2>&1
+  $exitCode = $LASTEXITCODE
+
+  $text = ''
+  if ($null -ne $output) {
+    if ($output -is [System.Array]) {
+      $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+    }
+    else {
+      $text = $output.ToString()
+    }
+  }
+
+  if ($exitCode -ne 0) {
+    throw "wezterm cli failed ($exitCode): $text"
+  }
+
+  return $text
+}
+
+function Write-VerificationResult($value) {
+  $json = $value | ConvertTo-Json -Compress -Depth 8
+  if ($ResultPath) {
+    Set-Content -Path $ResultPath -Value $json -Encoding UTF8
+    return
+  }
+  Write-Output $json
 }
 
 function Get-ProcessElevation([int]$ProcessId) {
@@ -84,21 +103,20 @@ function Get-ProcessElevation([int]$ProcessId) {
 
   $processHandle = [RalphWeztermWin32]::OpenProcess($PROCESS_QUERY_LIMITED_INFORMATION, $false, [uint32]$ProcessId)
   if ($processHandle -eq [IntPtr]::Zero) {
-    throw "OpenProcess failed for pid ${ProcessId}: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    return $false
   }
 
   $tokenHandle = [IntPtr]::Zero
   if (-not [RalphWeztermWin32]::OpenProcessToken($processHandle, $TOKEN_QUERY, [ref]$tokenHandle)) {
-    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
     [RalphWeztermWin32]::CloseHandle($processHandle) | Out-Null
-    throw "OpenProcessToken failed for pid ${ProcessId}: $errorCode"
+    return $false
   }
 
   try {
     $elevation = 0
     $returnLength = 0
     if (-not [RalphWeztermWin32]::GetTokenInformation($tokenHandle, $TokenElevation, [ref]$elevation, 4, [ref]$returnLength)) {
-      throw "GetTokenInformation failed for pid ${ProcessId}: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+      return $false
     }
     return [bool]$elevation
   }
@@ -110,7 +128,6 @@ function Get-ProcessElevation([int]$ProcessId) {
 
 function Get-VisibleWezTermWindows {
   $rows = New-Object System.Collections.Generic.List[object]
-  $foreground = [RalphWeztermWin32]::GetForegroundWindow().ToInt64()
 
   $null = [RalphWeztermWin32]::EnumWindows({
     param($hWnd, $lParam)
@@ -132,7 +149,6 @@ function Get-VisibleWezTermWindows {
       pid = $procId
       title = $text.ToString()
       elevated = Get-ProcessElevation -ProcessId $procId
-      isForeground = ($hWnd.ToInt64() -eq $foreground)
     }) | Out-Null
     return $true
   }, [IntPtr]::Zero)
@@ -140,10 +156,24 @@ function Get-VisibleWezTermWindows {
   return @($rows.ToArray())
 }
 
-function Get-CurrentProcessElevated {
-  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-  $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-  return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+function Get-ForegroundWindowInfo {
+  $handle = [RalphWeztermWin32]::GetForegroundWindow()
+  if ($handle -eq [IntPtr]::Zero) {
+    return [pscustomobject]@{ handle = 0; pid = 0; title = ''; elevated = $false }
+  }
+
+  $procId = 0
+  [void][RalphWeztermWin32]::GetWindowThreadProcessId($handle, [ref]$procId)
+  $length = [RalphWeztermWin32]::GetWindowTextLength($handle)
+  $text = New-Object System.Text.StringBuilder ($length + 1)
+  [void][RalphWeztermWin32]::GetWindowText($handle, $text, $text.Capacity)
+
+  return [pscustomobject]@{
+    handle = $handle.ToInt64()
+    pid = $procId
+    title = $text.ToString()
+    elevated = if ($procId -gt 0) { Get-ProcessElevation -ProcessId $procId } else { $false }
+  }
 }
 
 function Wait-ForFile([string]$Path, [int]$TimeoutSeconds = 15) {
@@ -155,6 +185,22 @@ function Wait-ForFile([string]$Path, [int]$TimeoutSeconds = 15) {
   throw "Timed out waiting for $Path"
 }
 
+function Wait-ForPane([int]$TimeoutSeconds = 20) {
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    try {
+      $paneList = Invoke-WezTermCli @('list', '--format', 'json') | ConvertFrom-Json
+      if ($paneList.Count -gt 0) {
+        return $paneList[0]
+      }
+    }
+    catch {
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  throw "Timed out waiting for WezTerm class '$WezTermClass' to expose a pane."
+}
+
 function New-KeyInput([UInt16]$vk, [bool]$keyUp = $false) {
   $KEYEVENTF_KEYUP = 0x0002
   $input = New-Object RalphWeztermWin32+INPUT
@@ -162,21 +208,6 @@ function New-KeyInput([UInt16]$vk, [bool]$keyUp = $false) {
   $input.U.ki.wVk = $vk
   $input.U.ki.dwFlags = if ($keyUp) { $KEYEVENTF_KEYUP } else { 0 }
   return $input
-}
-
-function Focus-WezTermWindow([UInt64]$WindowHandle) {
-  $VK_MENU = 0x12
-  $KEYEVENTF_KEYUP = 0x0002
-  $handle = [IntPtr]::new([Int64]$WindowHandle)
-  [RalphWeztermWin32]::keybd_event($VK_MENU, 0, 0, [UIntPtr]::Zero)
-  Start-Sleep -Milliseconds 50
-  [RalphWeztermWin32]::keybd_event($VK_MENU, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
-  Start-Sleep -Milliseconds 50
-  [RalphWeztermWin32]::ShowWindowAsync($handle, 5) | Out-Null
-  if (-not [RalphWeztermWin32]::SetForegroundWindow($handle)) {
-    throw "Failed to focus WezTerm window $WindowHandle"
-  }
-  Start-Sleep -Milliseconds 400
 }
 
 function Send-CtrlShiftVAndEnter {
@@ -195,204 +226,191 @@ function Send-CtrlShiftVAndEnter {
   Start-Sleep -Milliseconds 500
 }
 
-function Invoke-WezTermCli([string[]]$Args) {
-  $output = & $wezterm @Args 2>&1
-  $exitCode = $LASTEXITCODE
-
-  $text = ''
-  if ($null -ne $output) {
-    if ($output -is [System.Array]) {
-      $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
-    }
-    else {
-      $text = $output.ToString()
-    }
+function Focus-WezTermWindow([UInt64]$WindowHandle) {
+  $VK_MENU = 0x12
+  $KEYEVENTF_KEYUP = 0x0002
+  $handle = [IntPtr]::new([Int64]$WindowHandle)
+  [RalphWeztermWin32]::keybd_event($VK_MENU, 0, 0, [UIntPtr]::Zero)
+  Start-Sleep -Milliseconds 50
+  [RalphWeztermWin32]::keybd_event($VK_MENU, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+  Start-Sleep -Milliseconds 50
+  [RalphWeztermWin32]::ShowWindowAsync($handle, 5) | Out-Null
+  $setForeground = [RalphWeztermWin32]::SetForegroundWindow($handle)
+  Start-Sleep -Milliseconds 400
+  $foreground = Get-ForegroundWindowInfo
+  return [pscustomobject]@{
+    requestedHandle = $WindowHandle
+    setForeground = $setForeground
+    foreground = $foreground
+    focused = ($foreground.handle -eq [Int64]$WindowHandle)
   }
-
-  if ($exitCode -ne 0) {
-    throw "wezterm cli failed ($exitCode): $text"
-  }
-
-  return $text
 }
 
-function Write-VerificationResult($value) {
-  $json = $value | ConvertTo-Json -Compress -Depth 6
-  if ($ResultPath) {
-    Set-Content -Path $ResultPath -Value $json -Encoding UTF8
-    return
-  }
-  Write-Output $json
-}
+function Start-VerificationWindow {
+  $beforeHandles = @(Get-VisibleWezTermWindows | ForEach-Object { $_.handle })
 
-function Invoke-ElevatedVerifier([string]$ScriptPath) {
-  $resultFile = Join-Path $env:TEMP ("ralph-smart-paste-" + [guid]::NewGuid().ToString() + ".json")
+  Write-Progress "launching verification window class=$WezTermClass"
+  $proc = Start-Process -FilePath $wezterm -PassThru -ArgumentList @(
+    'start',
+    '--always-new-process',
+    '--class', $WezTermClass,
+    '--',
+    'wsl.exe', '-d', 'Ubuntu', '--cd', '/home/devkit/.pi/agent/extensions/pi-multi-modal', '--exec', 'zsh', '-i'
+  )
+
   try {
-    $proc = Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -Wait -PassThru -ArgumentList @(
-      '-NoProfile',
-      '-ExecutionPolicy', 'Bypass',
-      '-File', $ScriptPath,
-      '-SkipAutoElevate',
-      '-CurrentPaneId', $currentPaneId,
-      '-ResultPath', $resultFile
-    )
-
-    if (-not (Test-Path $resultFile)) {
-      throw 'UAC prompt was not approved or the elevated verifier did not return a result file.'
-    }
-
-    $raw = Get-Content -Path $resultFile -Raw
-    if ($proc.ExitCode -ne 0) {
-      try {
-        $parsed = $raw | ConvertFrom-Json
-        if ($parsed.error) {
-          throw [string]$parsed.error
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline) {
+      $current = Get-VisibleWezTermWindows | Where-Object { -not $_.elevated -and $_.handle -notin $beforeHandles }
+      if ($current.Count -gt 0) {
+        $window = $current | Sort-Object pid -Descending | Select-Object -First 1
+        try {
+          $pane = Wait-ForPane
+          return [pscustomobject]@{
+            processId = $proc.Id
+            window = $window
+            pane = $pane
+          }
+        }
+        catch {
+          throw (
+            "Spawned verification window handle=$($window.handle) pid=$($window.pid) title=$($window.title), " +
+            "but wezterm cli could not attach with class '$WezTermClass'."
+          )
         }
       }
-      catch {
-        throw "Elevated verifier failed: $raw"
+      Start-Sleep -Milliseconds 500
+    }
+
+    throw "Timed out waiting for verification window class '$WezTermClass'."
+  }
+  catch {
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    throw
+  }
+}
+
+function Stop-VerificationWindow([int]$PaneId, [int]$ProcessId) {
+  Write-Progress 'cleaning up verification window'
+  try {
+    Invoke-WezTermCli @('send-text', '--pane-id', $PaneId, '--no-paste', "exit`r") | Out-Null
+    Start-Sleep -Seconds 1
+  }
+  catch {
+  }
+
+  try {
+    Invoke-WezTermCli @('kill-pane', '--pane-id', $PaneId) | Out-Null
+  }
+  catch {
+  }
+
+  try {
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+  }
+  catch {
+  }
+}
+
+function Invoke-TextProof([int]$PaneId, [UInt64]$WindowHandle) {
+  Remove-Item $wslTextResult -ErrorAction SilentlyContinue
+  Invoke-WezTermCli @('send-text', '--pane-id', $PaneId, '--no-paste', [string][char]3) | Out-Null
+  Start-Sleep -Seconds 1
+  Invoke-WezTermCli @('send-text', '--pane-id', $PaneId, '--no-paste', 'python3 -c ''import sys, pathlib; pathlib.Path("/tmp/ralph_direct_shell_text_result.txt").write_text(sys.argv[1])'' ') | Out-Null
+
+  Set-Clipboard -Value $textProofValue
+  Start-Sleep -Milliseconds 300
+
+  $focus = Focus-WezTermWindow -WindowHandle $WindowHandle
+  if (-not $focus.focused) {
+    throw (
+      "Unable to focus verification window handle=$WindowHandle before Ctrl+Shift+V. " +
+      "setForeground=$($focus.setForeground) foregroundHandle=$($focus.foreground.handle) foregroundTitle=$($focus.foreground.title) foregroundElevated=$($focus.foreground.elevated)."
+    )
+  }
+
+  Send-CtrlShiftVAndEnter
+  Wait-ForFile -Path $wslTextResult
+  return (Get-Content $wslTextResult -Raw)
+}
+
+function Invoke-ImageProof([int]$PaneId, [UInt64]$WindowHandle) {
+  Remove-Item $wslImageResult -ErrorAction SilentlyContinue
+  Invoke-WezTermCli @('send-text', '--pane-id', $PaneId, '--no-paste', [string][char]3) | Out-Null
+  Start-Sleep -Seconds 1
+  Invoke-WezTermCli @('send-text', '--pane-id', $PaneId, '--no-paste', 'python3 -c ''import sys, pathlib; p = pathlib.Path(sys.argv[1]); pathlib.Path("/tmp/ralph_direct_shell_image_result.txt").write_text(str(p.resolve()) if p.exists() else "MISSING:" + sys.argv[1])'' ') | Out-Null
+
+  $bitmap = New-Object System.Drawing.Bitmap 2,2
+  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+  $graphics.Clear([System.Drawing.Color]::FromArgb(255, 0, 128, 255))
+  $graphics.Dispose()
+  [System.Windows.Forms.Clipboard]::SetImage($bitmap)
+  $bitmap.Dispose()
+  Start-Sleep -Milliseconds 300
+
+  $focus = Focus-WezTermWindow -WindowHandle $WindowHandle
+  if (-not $focus.focused) {
+    throw (
+      "Unable to focus verification window handle=$WindowHandle before image Ctrl+Shift+V. " +
+      "setForeground=$($focus.setForeground) foregroundHandle=$($focus.foreground.handle) foregroundTitle=$($focus.foreground.title) foregroundElevated=$($focus.foreground.elevated)."
+    )
+  }
+
+  Send-CtrlShiftVAndEnter
+  Wait-ForFile -Path $wslImageResult
+  return (Get-Content $wslImageResult -Raw)
+}
+
+function Read-SmartPasteLogTail([DateTime]$StartTime) {
+  if (-not (Test-Path $smartPasteLog)) {
+    return @()
+  }
+
+  return @(
+    Get-Content -Path $smartPasteLog -Tail 40 |
+      Where-Object {
+        ($_ -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ') -and
+        ([datetime]::ParseExact($_.Substring(0, 19), 'yyyy-MM-dd HH:mm:ss', $null) -ge $StartTime)
       }
-    }
-
-    if ($ResultPath) {
-      Set-Content -Path $ResultPath -Value $raw -Encoding UTF8
-      return
-    }
-
-    Write-Output $raw
-    return
-  }
-  finally {
-    Remove-Item -Path $resultFile -ErrorAction SilentlyContinue
-  }
+  )
 }
 
 function Invoke-Verification {
-  if (-not $currentPaneId) {
-    throw 'WEZTERM_PANE is not set. Run this verifier from inside the target elevated WezTerm pane.'
-  }
+  $startTime = Get-Date
+  $visibleBefore = Get-VisibleWezTermWindows
+  $verification = Start-VerificationWindow
 
-  $paneList = Invoke-WezTermCli @('cli', 'list', '--format', 'json') | ConvertFrom-Json
-  $currentPane = $paneList | Where-Object { $_.pane_id -eq [int]$currentPaneId } | Select-Object -First 1
-  if (-not $currentPane) {
-    throw "Current pane id $currentPaneId was not found by wezterm cli list."
-  }
-
-  $visibleWezTermWindows = Get-VisibleWezTermWindows
-  if ($visibleWezTermWindows.Count -eq 0) {
-    throw 'No visible WezTerm GUI window found. Open the real Windows WezTerm window first.'
-  }
-
-  $targetWindow = $visibleWezTermWindows | Where-Object { $_.title -eq $currentPane.window_title } | Select-Object -First 1
-  if (-not $targetWindow) {
-    $targetWindow = $visibleWezTermWindows | Where-Object { $_.title -eq $currentPane.title } | Select-Object -First 1
-  }
-  if (-not $targetWindow) {
-    $targetWindow = $visibleWezTermWindows | Where-Object isForeground | Select-Object -First 1
-  }
-  if (-not $targetWindow) {
-    $targetWindow = $visibleWezTermWindows | Select-Object -First 1
-  }
-
-  $currentProcessElevated = Get-CurrentProcessElevated
-  Write-Progress "current pane=$currentPaneId elevated=$currentProcessElevated targetWindowPid=$($targetWindow.pid) title=$($targetWindow.title) paneWindowTitle=$($currentPane.window_title)"
-
-  if ($targetWindow.elevated -and -not $currentProcessElevated) {
-    if ($SkipAutoElevate) {
-      throw (
-        "Refusing to fake proof: the visible real WezTerm window pid=$($targetWindow.pid) is elevated, but this verifier is not elevated. " +
-        'Windows UIPI blocks non-elevated key injection into elevated GUI windows, so Ctrl+Shift+V cannot be verified from this session. ' +
-        'Re-run this verifier from an elevated Windows PowerShell process on the same desktop as the target WezTerm window.'
-      )
-    }
-
-    Write-Progress 'attempting RunAs relaunch'
-    Invoke-ElevatedVerifier -ScriptPath $PSCommandPath
-    return $null
-  }
-
-  Remove-Item $wslTextResult, $wslImageResult -ErrorAction SilentlyContinue
+  Write-Progress "verification pid=$($verification.processId) pane=$($verification.pane.pane_id) handle=$($verification.window.handle) title=$($verification.window.title)"
 
   try {
-    $paneId = $currentPaneId
-    Focus-WezTermWindow -WindowHandle ([UInt64]$targetWindow.handle)
-
-    Write-Progress 'switching current pane into direct WSL zsh'
-    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', [string][char]3) | Out-Null
-    Start-Sleep -Seconds 1
-    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', "$wslStartCommand`r") | Out-Null
-    Start-Sleep -Seconds 4
-
-    Write-Progress 'running text proof'
-    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', [string][char]3) | Out-Null
-    Start-Sleep -Seconds 1
-    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', "python3 $wslTextChecker ") | Out-Null
-    Set-Clipboard -Value 'direct-shell-text-proof'
-    Start-Sleep -Milliseconds 300
-    Send-CtrlShiftVAndEnter
-    Wait-ForFile -Path $wslTextResult
-
-    Write-Progress 'running image proof'
-    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', [string][char]3) | Out-Null
-    Start-Sleep -Seconds 1
-    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', "python3 $wslImageChecker ") | Out-Null
-
-    $bitmap = New-Object System.Drawing.Bitmap 2,2
-    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-    $graphics.Clear([System.Drawing.Color]::FromArgb(255, 0, 128, 255))
-    $graphics.Dispose()
-    [System.Windows.Forms.Clipboard]::SetImage($bitmap)
-    $bitmap.Dispose()
-    Start-Sleep -Milliseconds 300
-    Send-CtrlShiftVAndEnter
-    Wait-ForFile -Path $wslImageResult
+    $text = Invoke-TextProof -PaneId $verification.pane.pane_id -WindowHandle ([UInt64]$verification.window.handle)
+    $image = Invoke-ImageProof -PaneId $verification.pane.pane_id -WindowHandle ([UInt64]$verification.window.handle)
 
     return [pscustomobject]@{
-      targetWindow = $targetWindow
-      currentProcessElevated = $currentProcessElevated
-      currentPaneId = $currentPaneId
-      text = Get-Content $wslTextResult -Raw
-      image = Get-Content $wslImageResult -Raw
+      currentProcessElevated = Get-ProcessElevation -ProcessId $PID
+      targetWindow = $verification.window
+      pane = $verification.pane
+      text = $text
+      image = $image
+      smartPasteLogTail = Read-SmartPasteLogTail -StartTime $startTime
+      visibleWindowsBefore = $visibleBefore
+      visibleWindowsAfter = Get-VisibleWezTermWindows
     }
-  }
-  catch {
-    $paneText = ''
-    if ($paneId) {
-      try {
-        $paneText = Invoke-WezTermCli @('cli', 'get-text', '--pane-id', $paneId, '--start-line', '-30') | Out-String
-      }
-      catch {
-      }
-    }
-
-    $message = $_.Exception.Message
-    if ($paneText) {
-      $message += "`n--- pane ---`n$paneText"
-    }
-    throw $message
   }
   finally {
-    if ($paneId) {
-      Write-Progress "restoring pane $paneId to PowerShell"
-      try {
-        Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', "exit`r") | Out-Null
-      }
-      catch {
-      }
-    }
+    Stop-VerificationWindow -PaneId $verification.pane.pane_id -ProcessId $verification.processId
   }
 }
 
 try {
   $result = Invoke-Verification
-  if ($null -ne $result) {
-    Write-VerificationResult $result
-  }
+  Write-VerificationResult $result
 }
 catch {
-  if ($ResultPath) {
-    Write-VerificationResult ([pscustomobject]@{ error = $_.Exception.Message })
-    exit 1
-  }
-  throw
+  Write-VerificationResult ([pscustomobject]@{
+    error = $_.Exception.Message
+    foreground = Get-ForegroundWindowInfo
+    visibleWindows = Get-VisibleWezTermWindows
+  })
+  exit 1
 }
