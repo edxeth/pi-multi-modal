@@ -66,7 +66,7 @@ When the current item changes paste behavior or verification logic, also run the
 - `cd /home/devkit/.pi/agent/extensions/pi-multi-modal && npm run test:integration` (if the item touches code paths covered by integration tests or adds integration coverage)
 - the goal-specific smart-paste E2E verification for the affected user path(s) using the real Windows WezTerm + WSL environment
 
-For this goal, acceptable E2E proof requires real-path verification against:
+For this goal, preferred E2E proof is real-path verification against:
 - direct shell outside tmux
 - direct Neovim outside tmux
 - direct PI outside tmux
@@ -74,17 +74,20 @@ For this goal, acceptable E2E proof requires real-path verification against:
 - Neovim inside tmux
 - PI inside tmux
 
+If the active session is blocked from driving the real Windows GUI path by focus/UIPI/admin boundaries, acceptable fallback proof may use the closest automatable path for the same owner/route, provided you also record the exact blocker commands and outcomes in `.ralph/progress.md`.
+
 If the repo already contains a tracked smart-paste E2E harness, use it and record the exact command.
 If it does not yet exist, the highest-priority unfinished verification item is to add one. Until then, any item that changes paste behavior must still execute the exact WezTerm/PowerShell/WSL commands needed to prove the affected path and record those commands plus outcomes in `.ralph/progress.md`.
 
-Do not mark an item complete based only on synthetic route injection if the user-facing failing path is a real Windows GUI keybinding path. The actual failing path must be proven.
+Do not mark an item complete based only on synthetic route injection if the real Windows GUI keybinding path is still practically testable from the active session. If that path is blocked by verified environment constraints, you may use the closest automatable proof for the same owner/route, but you must record the blocker evidence and the substituted proof path explicitly in `.ralph/progress.md`.
 
 # No-Bypass Rules
 
 - Do not skip checks or weaken tests to pass.
 - Do not use bypass flags or failure masking patterns such as `--no-verify`, `|| true`, suppressing failures, or deleting/neutralizing tests.
 - Do not claim success without evidence from executed checks.
-- Do not replace a failing direct-path proof with a neighboring synthetic-path proof.
+- Do not replace a failing direct-path proof with a neighboring synthetic-path proof when the direct path remains practically testable from the active session.
+- If the direct path is blocked by verified environment constraints, you may use the closest automatable proof path, but only with explicit blocker evidence recorded in `.ralph/progress.md`.
 - Do not reintroduce clipboard watchers, cache files, or hidden background helpers into the standard flow.
 
 # Source-Doc Protection
@@ -124,3 +127,4 @@ Do not emit any other control promise.
 - Close any windows the agent opened once they are no longer needed.
 - Do not leave extra WezTerm or helper windows open at the end of a step or iteration.
 - Never close the user's pre-existing windows; only close windows created by the current iteration unless the user explicitly instructs otherwise.
+- If the current E2E approach starts looping on UAC/elevation/window-routing without yielding user-path proof, stop that approach, record the blocker, clean up agent-opened windows, and move to the next iteration instead of repeating the same path.
