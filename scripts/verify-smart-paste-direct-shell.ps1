@@ -195,7 +195,24 @@ function Send-CtrlShiftVAndEnter {
 }
 
 function Invoke-WezTermCli([string[]]$Args) {
-  & $wezterm @Args
+  $output = & $wezterm @Args 2>&1
+  $exitCode = $LASTEXITCODE
+
+  $text = ''
+  if ($null -ne $output) {
+    if ($output -is [System.Array]) {
+      $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+    }
+    else {
+      $text = $output.ToString()
+    }
+  }
+
+  if ($exitCode -ne 0) {
+    throw "wezterm cli failed ($exitCode): $text"
+  }
+
+  return $text
 }
 
 function Write-VerificationResult($value) {
@@ -284,7 +301,12 @@ function Invoke-Verification {
 
   try {
     Write-Progress 'spawning temporary direct-shell tab from current pane'
-    $paneId = (Invoke-WezTermCli @('cli', 'spawn', '--pane-id', $currentPaneId, 'wsl.exe', '-d', 'Ubuntu', '--cd', '/home/devkit/.pi/agent/extensions/pi-multi-modal', '--exec', 'zsh', '-i')).Trim()
+    $spawnOutput = Invoke-WezTermCli @('cli', 'spawn', '--pane-id', $currentPaneId, 'wsl.exe', '-d', 'Ubuntu', '--cd', '/home/devkit/.pi/agent/extensions/pi-multi-modal', '--exec', 'zsh', '-i')
+    $paneId = ''
+    if ($spawnOutput) {
+      $paneId = $spawnOutput.Trim()
+    }
+    Write-Progress "spawn output=$spawnOutput"
     if (-not $paneId) {
       throw 'Failed to create temporary direct-shell pane in the current WezTerm window.'
     }
@@ -344,7 +366,12 @@ function Invoke-Verification {
       catch {
       }
     }
-    throw ($_.Exception.Message + (if ($paneText) { "`n--- pane ---`n$paneText" } else { '' }))
+
+    $message = $_.Exception.Message
+    if ($paneText) {
+      $message += "`n--- pane ---`n$paneText"
+    }
+    throw $message
   }
   finally {
     if ($paneId) {
