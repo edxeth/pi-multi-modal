@@ -1,5 +1,6 @@
 param(
   [string]$ResultPath = '',
+  [string]$CurrentPaneId = '',
   [switch]$SkipAutoElevate
 )
 
@@ -69,7 +70,7 @@ $wslImageResult = '\\wsl.localhost\Ubuntu\tmp\ralph_direct_shell_image_result.tx
 $wslTextChecker = '/tmp/ralph_check_text.py'
 $wslImageChecker = '/tmp/ralph_check_image.py'
 $wslStartCommand = 'wsl.exe -d Ubuntu --cd /home/devkit/.pi/agent/extensions/pi-multi-modal --exec zsh -i'
-$currentPaneId = $env:WEZTERM_PANE
+$currentPaneId = if ($CurrentPaneId) { $CurrentPaneId } else { $env:WEZTERM_PANE }
 $paneId = $null
 
 function Write-Progress([string]$message) {
@@ -232,6 +233,7 @@ function Invoke-ElevatedVerifier([string]$ScriptPath) {
       '-ExecutionPolicy', 'Bypass',
       '-File', $ScriptPath,
       '-SkipAutoElevate',
+      '-CurrentPaneId', $currentPaneId,
       '-ResultPath', $resultFile
     )
 
@@ -270,18 +272,30 @@ function Invoke-Verification {
     throw 'WEZTERM_PANE is not set. Run this verifier from inside the target elevated WezTerm pane.'
   }
 
+  $paneList = Invoke-WezTermCli @('cli', 'list', '--format', 'json') | ConvertFrom-Json
+  $currentPane = $paneList | Where-Object { $_.pane_id -eq [int]$currentPaneId } | Select-Object -First 1
+  if (-not $currentPane) {
+    throw "Current pane id $currentPaneId was not found by wezterm cli list."
+  }
+
   $visibleWezTermWindows = Get-VisibleWezTermWindows
   if ($visibleWezTermWindows.Count -eq 0) {
     throw 'No visible WezTerm GUI window found. Open the real Windows WezTerm window first.'
   }
 
-  $targetWindow = $visibleWezTermWindows | Where-Object isForeground | Select-Object -First 1
+  $targetWindow = $visibleWezTermWindows | Where-Object { $_.title -eq $currentPane.window_title } | Select-Object -First 1
+  if (-not $targetWindow) {
+    $targetWindow = $visibleWezTermWindows | Where-Object { $_.title -eq $currentPane.title } | Select-Object -First 1
+  }
+  if (-not $targetWindow) {
+    $targetWindow = $visibleWezTermWindows | Where-Object isForeground | Select-Object -First 1
+  }
   if (-not $targetWindow) {
     $targetWindow = $visibleWezTermWindows | Select-Object -First 1
   }
 
   $currentProcessElevated = Get-CurrentProcessElevated
-  Write-Progress "current pane=$currentPaneId elevated=$currentProcessElevated targetWindowPid=$($targetWindow.pid) title=$($targetWindow.title)"
+  Write-Progress "current pane=$currentPaneId elevated=$currentProcessElevated targetWindowPid=$($targetWindow.pid) title=$($targetWindow.title) paneWindowTitle=$($currentPane.window_title)"
 
   if ($targetWindow.elevated -and -not $currentProcessElevated) {
     if ($SkipAutoElevate) {
@@ -300,29 +314,14 @@ function Invoke-Verification {
   Remove-Item $wslTextResult, $wslImageResult -ErrorAction SilentlyContinue
 
   try {
-    Write-Progress 'spawning temporary direct-shell tab from current pane'
-    $spawnOutput = Invoke-WezTermCli @('cli', 'spawn', '--pane-id', $currentPaneId, 'wsl.exe', '-d', 'Ubuntu', '--cd', '/home/devkit/.pi/agent/extensions/pi-multi-modal', '--exec', 'zsh', '-i')
-    $paneId = ''
-    if ($spawnOutput) {
-      $paneId = $spawnOutput.Trim()
-    }
-    Write-Progress "spawn output=$spawnOutput"
-    if (-not $paneId) {
-      throw 'Failed to create temporary direct-shell pane in the current WezTerm window.'
-    }
-
-    Start-Sleep -Seconds 3
-
-    $paneList = Invoke-WezTermCli @('cli', 'list', '--format', 'json') | ConvertFrom-Json
-    $spawnedPane = $paneList | Where-Object { $_.pane_id -eq [int]$paneId } | Select-Object -First 1
-    if ($spawnedPane -and $spawnedPane.tab_id) {
-      Invoke-WezTermCli @('cli', 'activate-tab', '--tab-id', [string]$spawnedPane.tab_id) | Out-Null
-      Start-Sleep -Milliseconds 300
-    }
-    Invoke-WezTermCli @('cli', 'activate-pane', '--pane-id', $paneId) | Out-Null
-    Start-Sleep -Milliseconds 500
-
+    $paneId = $currentPaneId
     Focus-WezTermWindow -WindowHandle ([UInt64]$targetWindow.handle)
+
+    Write-Progress 'switching current pane into direct WSL zsh'
+    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', [string][char]3) | Out-Null
+    Start-Sleep -Seconds 1
+    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', "$wslStartCommand`r") | Out-Null
+    Start-Sleep -Seconds 4
 
     Write-Progress 'running text proof'
     Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', [string][char]3) | Out-Null
@@ -352,7 +351,6 @@ function Invoke-Verification {
       targetWindow = $targetWindow
       currentProcessElevated = $currentProcessElevated
       currentPaneId = $currentPaneId
-      spawnedPaneId = $paneId
       text = Get-Content $wslTextResult -Raw
       image = Get-Content $wslImageResult -Raw
     }
@@ -375,9 +373,9 @@ function Invoke-Verification {
   }
   finally {
     if ($paneId) {
-      Write-Progress "cleaning up pane $paneId"
+      Write-Progress "restoring pane $paneId to PowerShell"
       try {
-        Invoke-WezTermCli @('cli', 'kill-pane', '--pane-id', $paneId) | Out-Null
+        Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', "exit`r") | Out-Null
       }
       catch {
       }
