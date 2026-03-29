@@ -31,7 +31,7 @@
 				"Press Ctrl+Shift+V with text clipboard data and verify the text appears in the shell input buffer.",
 				"Press Ctrl+Shift+V with image clipboard data and verify a usable Linux path is inserted into the shell input buffer."
 			],
-			"passes": false,
+			"passes": true,
 			"regression_notes": ""
 		},
 		{
