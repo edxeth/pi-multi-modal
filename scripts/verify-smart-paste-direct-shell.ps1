@@ -1,3 +1,8 @@
+param(
+  [string]$ResultPath = '',
+  [switch]$SkipAutoElevate
+)
+
 $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -188,74 +193,145 @@ function Invoke-WezTermCli([string[]]$Args) {
   & $wezterm @Args
 }
 
-$visibleWezTermWindows = Get-VisibleWezTermWindows
-if ($visibleWezTermWindows.Count -eq 0) {
-  throw 'No visible WezTerm GUI window found. Open the real Windows WezTerm window first.'
+function Write-VerificationResult($value) {
+  $json = $value | ConvertTo-Json -Compress -Depth 6
+  if ($ResultPath) {
+    Set-Content -Path $ResultPath -Value $json -Encoding UTF8
+    return
+  }
+  Write-Output $json
 }
 
-$targetWindow = $visibleWezTermWindows | Where-Object isForeground | Select-Object -First 1
-if (-not $targetWindow) {
-  $targetWindow = $visibleWezTermWindows | Select-Object -First 1
+function Invoke-ElevatedVerifier([string]$ScriptPath) {
+  $resultFile = Join-Path $env:TEMP ("ralph-smart-paste-" + [guid]::NewGuid().ToString() + ".json")
+  try {
+    $proc = Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -Wait -PassThru -ArgumentList @(
+      '-NoProfile',
+      '-ExecutionPolicy', 'Bypass',
+      '-File', $ScriptPath,
+      '-SkipAutoElevate',
+      '-ResultPath', $resultFile
+    )
+
+    if (-not (Test-Path $resultFile)) {
+      throw 'UAC prompt was not approved or the elevated verifier did not return a result file.'
+    }
+
+    $raw = Get-Content -Path $resultFile -Raw
+    if ($proc.ExitCode -ne 0) {
+      try {
+        $parsed = $raw | ConvertFrom-Json
+        if ($parsed.error) {
+          throw [string]$parsed.error
+        }
+      }
+      catch {
+        throw "Elevated verifier failed: $raw"
+      }
+    }
+
+    if ($ResultPath) {
+      Set-Content -Path $ResultPath -Value $raw -Encoding UTF8
+      return
+    }
+
+    Write-Output $raw
+    return
+  }
+  finally {
+    Remove-Item -Path $resultFile -ErrorAction SilentlyContinue
+  }
 }
 
-$currentProcessElevated = Get-CurrentProcessElevated
-if ($targetWindow.elevated -and -not $currentProcessElevated) {
-  throw (
-    "Refusing to fake proof: the visible real WezTerm window pid=$($targetWindow.pid) is elevated, but this verifier is not elevated. " +
-    'Windows UIPI blocks non-elevated key injection into elevated GUI windows, so Ctrl+Shift+V cannot be verified from this session. ' +
-    'Re-run this verifier from an elevated Windows PowerShell process on the same desktop as the target WezTerm window.'
-  )
-}
+function Invoke-Verification {
+  $visibleWezTermWindows = Get-VisibleWezTermWindows
+  if ($visibleWezTermWindows.Count -eq 0) {
+    throw 'No visible WezTerm GUI window found. Open the real Windows WezTerm window first.'
+  }
 
-Remove-Item $wslTextResult, $wslImageResult -ErrorAction SilentlyContinue
+  $targetWindow = $visibleWezTermWindows | Where-Object isForeground | Select-Object -First 1
+  if (-not $targetWindow) {
+    $targetWindow = $visibleWezTermWindows | Select-Object -First 1
+  }
+
+  $currentProcessElevated = Get-CurrentProcessElevated
+  if ($targetWindow.elevated -and -not $currentProcessElevated) {
+    if ($SkipAutoElevate) {
+      throw (
+        "Refusing to fake proof: the visible real WezTerm window pid=$($targetWindow.pid) is elevated, but this verifier is not elevated. " +
+        'Windows UIPI blocks non-elevated key injection into elevated GUI windows, so Ctrl+Shift+V cannot be verified from this session. ' +
+        'Re-run this verifier from an elevated Windows PowerShell process on the same desktop as the target WezTerm window.'
+      )
+    }
+
+    Invoke-ElevatedVerifier -ScriptPath $PSCommandPath
+    return $null
+  }
+
+  Remove-Item $wslTextResult, $wslImageResult -ErrorAction SilentlyContinue
+
+  try {
+    $paneId = (Invoke-WezTermCli @('cli', 'spawn', '--window-id', '0', 'wsl.exe', '-d', 'Ubuntu', '--cd', '/home/devkit/.pi/agent/extensions/pi-multi-modal', '--exec', 'zsh', '-i')).Trim()
+    if (-not $paneId) {
+      throw 'Failed to create temporary direct-shell pane in the real WezTerm window.'
+    }
+
+    Start-Sleep -Seconds 3
+    Invoke-WezTermCli @('cli', 'activate-pane', '--pane-id', $paneId) | Out-Null
+    Start-Sleep -Milliseconds 500
+
+    Focus-WezTermWindow -WindowHandle ([UInt64]$targetWindow.handle)
+
+    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', [string][char]3) | Out-Null
+    Start-Sleep -Seconds 1
+    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', "python3 $wslTextChecker ") | Out-Null
+    Set-Clipboard -Value 'direct-shell-text-proof'
+    Start-Sleep -Milliseconds 300
+    Send-CtrlShiftVAndEnter
+    Wait-ForFile -Path $wslTextResult
+
+    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', [string][char]3) | Out-Null
+    Start-Sleep -Seconds 1
+    Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', "python3 $wslImageChecker ") | Out-Null
+
+    $bitmap = New-Object System.Drawing.Bitmap 2,2
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $graphics.Clear([System.Drawing.Color]::FromArgb(255, 0, 128, 255))
+    $graphics.Dispose()
+    [System.Windows.Forms.Clipboard]::SetImage($bitmap)
+    $bitmap.Dispose()
+    Start-Sleep -Milliseconds 300
+    Send-CtrlShiftVAndEnter
+    Wait-ForFile -Path $wslImageResult
+
+    return [pscustomobject]@{
+      targetWindow = $targetWindow
+      currentProcessElevated = $currentProcessElevated
+      text = Get-Content $wslTextResult -Raw
+      image = Get-Content $wslImageResult -Raw
+    }
+  }
+  finally {
+    if ($paneId) {
+      try {
+        Invoke-WezTermCli @('cli', 'kill-pane', '--pane-id', $paneId) | Out-Null
+      }
+      catch {
+      }
+    }
+  }
+}
 
 try {
-  $paneId = (Invoke-WezTermCli @('cli', 'spawn', '--window-id', '0', 'wsl.exe', '-d', 'Ubuntu', '--cd', '/home/devkit/.pi/agent/extensions/pi-multi-modal', '--exec', 'zsh', '-i')).Trim()
-  if (-not $paneId) {
-    throw 'Failed to create temporary direct-shell pane in the real WezTerm window.'
+  $result = Invoke-Verification
+  if ($null -ne $result) {
+    Write-VerificationResult $result
   }
-
-  Start-Sleep -Seconds 3
-  Invoke-WezTermCli @('cli', 'activate-pane', '--pane-id', $paneId) | Out-Null
-  Start-Sleep -Milliseconds 500
-
-  Focus-WezTermWindow -WindowHandle ([UInt64]$targetWindow.handle)
-
-  Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', [string][char]3) | Out-Null
-  Start-Sleep -Seconds 1
-  Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', "python3 $wslTextChecker ") | Out-Null
-  Set-Clipboard -Value 'direct-shell-text-proof'
-  Start-Sleep -Milliseconds 300
-  Send-CtrlShiftVAndEnter
-  Wait-ForFile -Path $wslTextResult
-
-  Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', [string][char]3) | Out-Null
-  Start-Sleep -Seconds 1
-  Invoke-WezTermCli @('cli', 'send-text', '--pane-id', $paneId, '--no-paste', "python3 $wslImageChecker ") | Out-Null
-
-  $bitmap = New-Object System.Drawing.Bitmap 2,2
-  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-  $graphics.Clear([System.Drawing.Color]::FromArgb(255, 0, 128, 255))
-  $graphics.Dispose()
-  [System.Windows.Forms.Clipboard]::SetImage($bitmap)
-  $bitmap.Dispose()
-  Start-Sleep -Milliseconds 300
-  Send-CtrlShiftVAndEnter
-  Wait-ForFile -Path $wslImageResult
-
-  [pscustomobject]@{
-    targetWindow = $targetWindow
-    currentProcessElevated = $currentProcessElevated
-    text = Get-Content $wslTextResult -Raw
-    image = Get-Content $wslImageResult -Raw
-  } | ConvertTo-Json -Compress
 }
-finally {
-  if ($paneId) {
-    try {
-      Invoke-WezTermCli @('cli', 'kill-pane', '--pane-id', $paneId) | Out-Null
-    }
-    catch {
-    }
+catch {
+  if ($ResultPath) {
+    Write-VerificationResult ([pscustomobject]@{ error = $_.Exception.Message })
+    exit 1
   }
+  throw
 }
