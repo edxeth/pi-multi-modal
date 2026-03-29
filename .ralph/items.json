@@ -42,7 +42,7 @@
 				"Press Ctrl+Shift+V with text clipboard data and verify the text is inserted into the current buffer.",
 				"Press Ctrl+Shift+V with image clipboard data and verify an image path reference is inserted into the current buffer."
 			],
-			"passes": false,
+			"passes": true,
 			"regression_notes": ""
 		},
 		{

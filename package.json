@@ -28,6 +28,7 @@
 		"test:watch": "vitest",
 		"test:integration": "vitest run --config vitest.integration.config.ts",
 		"verify:smart-paste:direct-shell": "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify-smart-paste-direct-shell.ps1",
+		"verify:smart-paste:direct-nvim": "bash scripts/verify-smart-paste-direct-nvim.sh",
 		"verify:smart-paste:router": "node scripts/verify-wezterm-route-only.mjs"
 	},
 	"pi": {
