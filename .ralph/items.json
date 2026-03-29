@@ -86,7 +86,7 @@
 				"Run the repo-tracked smart-paste E2E harness against direct shell, direct Neovim, direct PI, tmux shell, tmux Neovim, and tmux PI.",
 				"Verify the harness exits 0 and records proof for all 12 text/image cases without bypass."
 			],
-			"passes": false,
+			"passes": true,
 			"regression_notes": ""
 		}
 	]
