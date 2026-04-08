@@ -33,6 +33,7 @@
 		"verify:smart-paste:tmux-shell": "bash scripts/verify-smart-paste-tmux-shell.sh",
 		"verify:smart-paste:tmux-nvim": "bash scripts/verify-smart-paste-tmux-nvim.sh",
 		"verify:smart-paste:tmux-pi": "bash scripts/verify-smart-paste-tmux-pi.sh",
+		"verify:tmux:chat-image-preview": "bash scripts/verify-chat-image-preview-tmux-pi.sh",
 		"verify:smart-paste:router": "node scripts/verify-wezterm-route-only.mjs",
 		"verify:smart-paste:matrix": "node scripts/verify-smart-paste-matrix.mjs"
 	},

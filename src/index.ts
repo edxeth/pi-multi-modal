@@ -163,21 +163,20 @@ const BASH_IMAGE_PREAMBLE = [
 type ToolTextBlock = { type: "text"; text: string };
 type ToolContentBlock = ToolTextBlock | ImageContent;
 type ToolResult = { content: ToolContentBlock[]; details: Record<string, never> };
-type PreviewCtx = {
+type AttachmentIndicatorCtx = {
 	cwd: string;
 	ui: {
 		setWidget: (
 			key: string,
-			content: string[] | undefined,
+			content: string[] | ((tui: any, theme: any) => any) | undefined,
 			options?: { placement?: "aboveEditor" | "belowEditor" },
 		) => void;
 		getEditorText: () => string;
-		theme: { fg: (color: string, value: string) => string; bold: (value: string) => string };
 	};
 };
 
-const IMAGE_PREVIEW_WIDGET_KEY = "multi-modal-image-preview";
-const IMAGE_PREVIEW_POLL_MS = 250;
+const ATTACHMENT_INDICATOR_WIDGET_KEY = "multi-modal-attachment-indicator";
+const ATTACHMENT_INDICATOR_POLL_MS = 250;
 
 function mimeTypeForImagePath(path: string): ImageContent["mimeType"] | undefined {
 	const ext = path.split(".").pop()?.toLowerCase();
@@ -254,6 +253,21 @@ async function getShowImagesSetting(cwd: string): Promise<boolean> {
 	return resolveShowImagesSetting(globalSettings, projectSettings);
 }
 
+async function countAttachableImages(cwd: string, text: string): Promise<number> {
+	let count = 0;
+	for (const imagePath of findExplicitImagePaths(text)) {
+		const absolutePath = resolveUserPath(cwd, imagePath);
+		if (!isImageFile(absolutePath) || !mimeTypeForImagePath(absolutePath)) {
+			continue;
+		}
+		try {
+			await access(absolutePath);
+			count += 1;
+		} catch {}
+	}
+	return count;
+}
+
 async function loadReferencedImagePreviews(cwd: string, text: string): Promise<ReferencedImagePreviewItem[]> {
 	const previews: ReferencedImagePreviewItem[] = [];
 
@@ -272,6 +286,54 @@ function isInTmux(): boolean {
 	return Boolean(process.env.TMUX);
 }
 
+function createAttachmentIndicatorController() {
+	let latestCtx: AttachmentIndicatorCtx | null = null;
+	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	let lastCount = 0;
+
+	function renderCount(count: number): void {
+		if (!latestCtx) return;
+		latestCtx.ui.setWidget(
+			ATTACHMENT_INDICATOR_WIDGET_KEY,
+			count > 0 ? [count === 1 ? "📎 1 image attached" : `📎 ${count} images attached`] : undefined,
+			{ placement: "aboveEditor" },
+		);
+	}
+
+	function reset(ctx?: AttachmentIndicatorCtx | null): void {
+		if (ctx) latestCtx = ctx;
+		lastCount = 0;
+		latestCtx?.ui.setWidget(ATTACHMENT_INDICATOR_WIDGET_KEY, undefined);
+	}
+
+	async function scan(): Promise<void> {
+		if (!latestCtx) return;
+		const count = await countAttachableImages(latestCtx.cwd, latestCtx.ui.getEditorText());
+		if (count === lastCount) return;
+		lastCount = count;
+		renderCount(count);
+	}
+
+	return {
+		attach(ctx: AttachmentIndicatorCtx) {
+			latestCtx = ctx;
+			reset(ctx);
+			if (pollTimer) clearInterval(pollTimer);
+			pollTimer = setInterval(() => {
+				void scan();
+			}, ATTACHMENT_INDICATOR_POLL_MS);
+		},
+		reset,
+		clear(ctx?: AttachmentIndicatorCtx | null) {
+			if (pollTimer) {
+				clearInterval(pollTimer);
+				pollTimer = null;
+			}
+			reset(ctx);
+		},
+	};
+}
+
 function createReferencedImagesComponent(
 	details: ReferencedImagePreviewDetails,
 	theme: {
@@ -279,17 +341,14 @@ function createReferencedImagesComponent(
 	},
 ): Component {
 	const container = new Container();
-	if (isInTmux()) {
-		const count = details.images.length;
-		container.addChild(
-			new Text(
-				theme.fg("customMessageText", count === 1 ? "📎 1 image attached" : `📎 ${count} images attached`),
-				0,
-				0,
-			),
-		);
+	const count = details.images.length;
+	container.addChild(
+		new Text(theme.fg("customMessageText", count === 1 ? "📎 1 image attached" : `📎 ${count} images attached`), 0, 0),
+	);
+	if (isInTmux() || !details.showImages) {
 		return container;
 	}
+	container.addChild(new Spacer(1));
 	for (const [index, image] of details.images.entries()) {
 		container.addChild(
 			new Image(
@@ -304,74 +363,6 @@ function createReferencedImagesComponent(
 		}
 	}
 	return container;
-}
-
-function createPreviewController() {
-	let tracked = new Set<string>();
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
-	let latestCtx: PreviewCtx | null = null;
-
-	function refreshWidget(): void {
-		if (!latestCtx) return;
-		if (tracked.size === 0) {
-			latestCtx.ui.setWidget(IMAGE_PREVIEW_WIDGET_KEY, undefined);
-			return;
-		}
-
-		const count = tracked.size;
-		latestCtx.ui.setWidget(
-			IMAGE_PREVIEW_WIDGET_KEY,
-			[count === 1 ? "📎 1 image attached" : `📎 ${count} images attached`],
-			{ placement: "aboveEditor" },
-		);
-	}
-
-	function resetWidget(ctx?: PreviewCtx | null): void {
-		if (ctx) latestCtx = ctx;
-		tracked = new Set();
-		latestCtx?.ui.setWidget(IMAGE_PREVIEW_WIDGET_KEY, undefined);
-	}
-
-	async function scanEditorText(): Promise<void> {
-		if (!latestCtx) return;
-		if (!(await getShowImagesSetting(latestCtx.cwd))) {
-			if (tracked.size > 0) resetWidget();
-			return;
-		}
-
-		const text = latestCtx.ui.getEditorText();
-		if (!text) {
-			if (tracked.size > 0) resetWidget();
-			return;
-		}
-
-		const currentPaths = new Set(findExplicitImagePaths(text));
-		const changed =
-			currentPaths.size !== tracked.size || [...currentPaths].some((imagePath) => !tracked.has(imagePath));
-		tracked = currentPaths;
-		if (changed) refreshWidget();
-	}
-
-	return {
-		attach(ctx: PreviewCtx) {
-			latestCtx = ctx;
-			resetWidget(ctx);
-			if (pollTimer) clearInterval(pollTimer);
-			pollTimer = setInterval(() => {
-				void scanEditorText();
-			}, IMAGE_PREVIEW_POLL_MS);
-		},
-		reset(ctx?: PreviewCtx | null) {
-			resetWidget(ctx);
-		},
-		clear(ctx?: PreviewCtx | null) {
-			if (pollTimer) {
-				clearInterval(pollTimer);
-				pollTimer = null;
-			}
-			resetWidget(ctx);
-		},
-	};
 }
 
 function createVisionAnalysisResult(label: string, summaryText: string): ToolResult {
@@ -1021,7 +1012,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 	});
 	let explicitMediaAnalysisPaths = new Set<string>();
-	const previewController = createPreviewController();
+	const attachmentIndicatorController = createAttachmentIndicatorController();
 
 	const handleSmartPaste = async (
 		ctx: Parameters<NonNullable<ExtensionAPI["registerShortcut"]>>[1]["handler"] extends (ctx: infer T) => unknown
@@ -1050,20 +1041,20 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.hasUI) {
 			setWeztermUserVar("PI_SMART_PASTE", "1");
-			previewController.attach(ctx as PreviewCtx);
+			attachmentIndicatorController.attach(ctx as AttachmentIndicatorCtx);
 		}
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
 		if (ctx.hasUI) {
-			previewController.attach(ctx as PreviewCtx);
+			attachmentIndicatorController.attach(ctx as AttachmentIndicatorCtx);
 		}
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (ctx.hasUI) {
 			setWeztermUserVar("PI_SMART_PASTE", "0");
-			previewController.clear(ctx as PreviewCtx);
+			attachmentIndicatorController.clear(ctx as AttachmentIndicatorCtx);
 		}
 	});
 
@@ -1071,7 +1062,7 @@ export default function (pi: ExtensionAPI) {
 		REFERENCED_IMAGES_MESSAGE_TYPE,
 		(message, _options, theme) => {
 			const details = message.details;
-			if (!details || !Array.isArray(details.images) || details.images.length === 0 || !details.showImages) {
+			if (!details || !Array.isArray(details.images) || details.images.length === 0) {
 				return undefined;
 			}
 			return createReferencedImagesComponent(details, theme);
@@ -1104,7 +1095,7 @@ export default function (pi: ExtensionAPI) {
 			findExplicitMediaPaths(event.text).map((path) => resolveUserPath(ctx.cwd, path)),
 		);
 		if (ctx.hasUI) {
-			previewController.reset(ctx as PreviewCtx);
+			attachmentIndicatorController.reset(ctx as AttachmentIndicatorCtx);
 		}
 
 		if (!supportsNativeImageInput(ctx.model?.input)) {
@@ -1146,10 +1137,6 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const showImages = await getShowImagesSetting(ctx.cwd);
-		if (!showImages) {
-			return undefined;
-		}
-
 		const images = await loadReferencedImagePreviews(ctx.cwd, event.prompt);
 		if (images.length === 0) {
 			return undefined;
