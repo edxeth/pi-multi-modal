@@ -1,13 +1,13 @@
 /**
- * Integration tests for GLM Image Summary Extension
+ * Integration tests for pi-multi-modal.
  *
- * These tests actually spawn pi with glm-4.6v and verify real image analysis.
+ * These tests spawn pi with the default pi-multi-modal backend and verify real image analysis.
  * They are slow and consume API credits, so run them purposefully:
  *
  *   npm run test:integration
  *
  * Prerequisites:
- * - Credentials available for `zai` or `zai-legacy` (`zai` is preferred when both work)
+ * - Credentials available for the configured backend (default: zai/glm-4.6v)
  * - Sample images in test-fixtures/ directory (see README)
  */
 
@@ -16,7 +16,7 @@ import { existsSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { extractTextFromPiOutput, resolveVisionProvider, VISION_MODEL } from "./utils.js";
+import { DEFAULT_MULTI_MODAL_BACKEND, extractTextFromPiOutput } from "./utils.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = resolvePath(__dirname, "../test-fixtures");
@@ -128,21 +128,20 @@ const TEST_IMAGES: Record<string, { file: string; expectedCategory: string; keyw
 };
 
 /**
- * Spawn pi with glm-4.6v to analyze an image
+ * Spawn pi with the default pi-multi-modal backend to analyze an image.
  */
 async function analyzeImageWithPi(imagePath: string, useStructuredPrompt = false): Promise<string> {
-	const provider = await resolveVisionProvider();
-
 	return new Promise((resolvePromise, reject) => {
 		const args = [
 			`@${imagePath}`,
 			"--provider",
-			provider,
+			DEFAULT_MULTI_MODAL_BACKEND.provider,
 			"--model",
-			VISION_MODEL,
+			DEFAULT_MULTI_MODAL_BACKEND.model,
 			"-p",
 			useStructuredPrompt ? ANALYSIS_PROMPT : "Analyze this image comprehensively.",
-			"--json",
+			"--mode",
+			"json",
 			"--print",
 			"--no-extensions",
 		];

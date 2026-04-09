@@ -2,46 +2,65 @@ import { describe, expect, it } from "vitest";
 import {
 	buildImageReferenceSuffix,
 	colorizeImagePlaceholders,
-	extractAvailableVisionProviders,
+	DEFAULT_MULTI_MODAL_BACKEND,
 	extractTextFromPiOutput,
 	findExplicitImagePaths,
 	findExplicitMediaPaths,
 	findImagePlaceholderIds,
 	findImageReferences,
 	findInlineImagePaths,
+	formatMultiModalBackend,
 	isImageFile,
 	isVideoFile,
 	needsVisionProxy,
 	parseBashImageOutput,
-	pickPreferredVisionProvider,
+	parseMultiModalBackend,
+	readMultiModalBackendSetting,
 	replaceExplicitInlineImagePathsWithPlaceholders,
 	replaceInlineImagePathsWithPlaceholders,
 	resolveShowImagesSetting,
 	SUPPORTED_IMAGE_EXTENSIONS,
 	SUPPORTED_VIDEO_EXTENSIONS,
 	sanitizeImagePromptForProvider,
-	shouldRetryWithFallbackVisionProvider,
 	supportsNativeImageInput,
 } from "./utils.js";
 
-describe("vision provider helpers", () => {
-	it("parses available glm-4.6v providers from pi output", () => {
-		const output = `provider      model        context  max-out  thinking  images
-zai-legacy    glm-4.6v     131.1K   32.8K    no        yes
-zai           glm-4.6v     131.1K   32.8K    no        yes
-zai-messages  glm-5-turbo  202.8K   128K     yes       no`;
-		expect(extractAvailableVisionProviders(output)).toEqual(["zai-legacy", "zai"]);
+describe("multi-modal backend helpers", () => {
+	it("parses provider, model, and optional thinking level", () => {
+		expect(parseMultiModalBackend("google/gemini-3-flash-preview:high")).toEqual({
+			provider: "google",
+			model: "gemini-3-flash-preview",
+			thinkingLevel: "high",
+		});
+		expect(parseMultiModalBackend("openrouter/openai/gpt-5.1-codex")).toEqual({
+			provider: "openrouter",
+			model: "openai/gpt-5.1-codex",
+		});
 	});
 
-	it("prefers zai over zai-legacy when both are available", () => {
-		expect(pickPreferredVisionProvider(["zai-legacy", "zai"])).toBe("zai");
-		expect(pickPreferredVisionProvider(["zai-legacy"])).toBe("zai-legacy");
+	it("only treats the trailing colon segment as thinking when it is a valid level", () => {
+		expect(parseMultiModalBackend("amazon-bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0")).toEqual({
+			provider: "amazon-bedrock",
+			model: "us.anthropic.claude-sonnet-4-20250514-v1:0",
+		});
 	});
 
-	it("retries provider fallback for auth or provider resolution errors", () => {
-		expect(shouldRetryWithFallbackVisionProvider(new Error("No API key found for zai."))).toBe(true);
-		expect(shouldRetryWithFallbackVisionProvider(new Error('No models matching "glm-4.6v"'))).toBe(true);
-		expect(shouldRetryWithFallbackVisionProvider(new Error("Connection reset by peer"))).toBe(false);
+	it("formats a backend reference for display", () => {
+		expect(formatMultiModalBackend({ provider: "google", model: "gemini-3-flash-preview" })).toBe(
+			"google/gemini-3-flash-preview",
+		);
+		expect(
+			formatMultiModalBackend({ provider: "google", model: "gemini-3-flash-preview", thinkingLevel: "high" }),
+		).toBe("google/gemini-3-flash-preview:high");
+	});
+
+	it("reads backend settings and falls back to defaults", () => {
+		expect(readMultiModalBackendSetting(undefined)).toEqual(DEFAULT_MULTI_MODAL_BACKEND);
+		expect(
+			readMultiModalBackendSetting({
+				multiModal: { provider: "google", model: "gemini-3-flash-preview", thinkingLevel: "high" },
+			}),
+		).toEqual({ provider: "google", model: "gemini-3-flash-preview", thinkingLevel: "high" });
 	});
 });
 
@@ -375,7 +394,35 @@ describe("extractTextFromPiOutput", () => {
 		expect(extractTextFromPiOutput(jsonOutput)).toBe("\nValid text");
 	});
 
+	it("extracts text from ndjson agent_end output", () => {
+		const output = [
+			JSON.stringify({ type: "session" }),
+			JSON.stringify({
+				type: "agent_end",
+				messages: [
+					{ role: "user", content: [{ type: "text", text: "Analyze" }] },
+					{ role: "assistant", content: [{ type: "text", text: "NDJSON analysis" }] },
+				],
+			}),
+		].join("\n");
+
+		expect(extractTextFromPiOutput(output)).toBe("NDJSON analysis");
+	});
+
+	it("extracts text from ndjson assistant message output", () => {
+		const output = [
+			JSON.stringify({ type: "session" }),
+			JSON.stringify({
+				type: "message_end",
+				message: { role: "assistant", content: [{ type: "text", text: "Final streamed response" }] },
+			}),
+		].join("\n");
+
+		expect(extractTextFromPiOutput(output)).toBe("Final streamed response");
+	});
+
 	it("handles empty string input", () => {
 		expect(extractTextFromPiOutput("")).toBe("");
 	});
 });
+

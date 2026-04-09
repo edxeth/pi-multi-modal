@@ -1,43 +1,43 @@
 /**
- * Vision fallback extension.
+ * Media fallback extension.
  *
  * For any model without native image input support, this extension can attach explicit
  * @image paths directly in the conversation, and it proxies media analysis through
- * glm-4.6v for non-vision read requests.
+ * a configurable backend for non-vision read requests.
  */
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { access, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ImageContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { BorderedLoader, createBashTool, createReadTool } from "@mariozechner/pi-coding-agent";
+import { BorderedLoader, createBashTool, createReadTool, getAgentDir } from "@mariozechner/pi-coding-agent";
 import { type Component, Container, Image, Spacer, Text } from "@mariozechner/pi-tui";
 import { extensionForImageMimeType, readClipboardImage } from "./clipboard-image.js";
 import {
+	DEFAULT_MULTI_MODAL_BACKEND,
 	extractTextFromPiOutput,
 	findExplicitImagePaths,
 	findExplicitMediaPaths,
-	getAvailableVisionProviders,
+	formatMultiModalBackend,
 	isImageFile,
 	isPdfFile,
 	isVideoFile,
+	type MultiModalBackendConfig,
 	needsVisionProxy,
 	PI_BASH_IMAGE_MARKER_PREFIX,
 	parseBashImageOutput,
-	pickPreferredVisionProvider,
+	parseMultiModalBackend,
+	readMultiModalBackendSetting,
 	replaceExplicitInlineImagePathsWithPlaceholders,
 	resolveShowImagesSetting,
 	sanitizeImagePromptForProvider,
-	shouldRetryWithFallbackVisionProvider,
 	supportsNativeImageInput,
-	VISION_MODEL,
-	VISION_PROVIDER_CANDIDATES,
 } from "./utils.js";
 
-// Embedded skill prompt for GLM-4.6v
+// Embedded analysis prompt for the configured media backend
 const IMAGE_ANALYSIS_PROMPT = `You are analyzing an image. Follow these steps:
 
 ## Step 1: Classify
@@ -237,6 +237,8 @@ interface ReferencedImagePreviewDetails {
 	images: ReferencedImagePreviewItem[];
 }
 
+const GLOBAL_SETTINGS_PATH = join(getAgentDir(), "settings.json");
+
 async function readJsonFileIfExists(path: string): Promise<unknown | undefined> {
 	try {
 		return JSON.parse(await readFile(path, "utf-8"));
@@ -245,9 +247,34 @@ async function readJsonFileIfExists(path: string): Promise<unknown | undefined> 
 	}
 }
 
+async function writeJsonFile(path: string, value: unknown): Promise<void> {
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function getMultiModalBackend(): Promise<MultiModalBackendConfig> {
+	return readMultiModalBackendSetting(await readJsonFileIfExists(GLOBAL_SETTINGS_PATH));
+}
+
+async function saveMultiModalBackend(config: MultiModalBackendConfig): Promise<void> {
+	const current = await readJsonFileIfExists(GLOBAL_SETTINGS_PATH);
+	const settings = current && typeof current === "object" && !Array.isArray(current) ? { ...current } : {};
+	(settings as Record<string, unknown>).multiModal = config.thinkingLevel
+		? {
+				provider: config.provider,
+				model: config.model,
+				thinkingLevel: config.thinkingLevel,
+			}
+		: {
+				provider: config.provider,
+				model: config.model,
+			};
+	await writeJsonFile(GLOBAL_SETTINGS_PATH, settings);
+}
+
 async function getShowImagesSetting(cwd: string): Promise<boolean> {
 	const [globalSettings, projectSettings] = await Promise.all([
-		readJsonFileIfExists(join(homedir(), ".pi", "agent", "settings.json")),
+		readJsonFileIfExists(GLOBAL_SETTINGS_PATH),
 		readJsonFileIfExists(join(cwd, ".pi", "settings.json")),
 	]);
 	return resolveShowImagesSetting(globalSettings, projectSettings);
@@ -365,9 +392,9 @@ function createReferencedImagesComponent(
 	return container;
 }
 
-function createVisionAnalysisResult(label: string, summaryText: string): ToolResult {
+function createVisionAnalysisResult(label: string, summaryText: string, backend: MultiModalBackendConfig): ToolResult {
 	return {
-		content: [{ type: "text", text: `[${label} analyzed with ${VISION_MODEL}]\n\n${summaryText}` }],
+		content: [{ type: "text", text: `[${label} analyzed with ${formatMultiModalBackend(backend)}]\n\n${summaryText}` }],
 		details: {},
 	};
 }
@@ -378,22 +405,23 @@ async function analyzeMediaToolResult(
 		image: boolean;
 		video: boolean;
 		pdf: boolean;
-		preferredProvider: string;
+		backend: MultiModalBackendConfig;
 		signal?: AbortSignal;
 		onUpdate?: (result: ToolResult) => void;
 	},
 ): Promise<ToolResult> {
-	const { video, pdf, preferredProvider, signal, onUpdate } = options;
+	const { video, pdf, backend, signal, onUpdate } = options;
 	const mediaType = video ? "video" : pdf ? "PDF" : "image";
+	const backendLabel = formatMultiModalBackend(backend);
 	onUpdate?.({
 		content: [
 			{
 				type: "text",
 				text: video
-					? `[Extracting keyframes and analyzing video with ${VISION_MODEL}...]`
+					? `[Extracting keyframes and analyzing video with ${backendLabel}...]`
 					: pdf
-						? `[Analyzing PDF with ${VISION_MODEL}...]`
-						: `[Analyzing image with ${VISION_MODEL}...]`,
+						? `[Analyzing PDF with ${backendLabel}...]`
+						: `[Analyzing image with ${backendLabel}...]`,
 			},
 		],
 		details: {},
@@ -401,16 +429,16 @@ async function analyzeMediaToolResult(
 
 	try {
 		const summaryText = video
-			? await analyzeVideo({ absolutePath, preferredProvider, signal })
+			? await analyzeVideo({ absolutePath, backend, signal })
 			: pdf
-				? await analyzePdf({ absolutePath, preferredProvider, signal })
-				: await analyzeImage({ absolutePath, preferredProvider, signal });
+				? await analyzePdf({ absolutePath, backend, signal })
+				: await analyzeImage({ absolutePath, backend, signal });
 
 		if (signal?.aborted) {
 			throw new Error("Operation aborted");
 		}
 
-		const result = createVisionAnalysisResult(video ? "Video" : pdf ? "PDF" : "Image", summaryText);
+		const result = createVisionAnalysisResult(video ? "Video" : pdf ? "PDF" : "Image", summaryText, backend);
 		onUpdate?.(result);
 		return result;
 	} catch (error) {
@@ -421,59 +449,41 @@ async function analyzeMediaToolResult(
 
 interface AnalyzeImageOptions {
 	absolutePath: string;
-	preferredProvider: string;
+	backend: MultiModalBackendConfig;
 	signal?: AbortSignal;
 }
 
 interface AnalyzeVideoOptions {
 	absolutePath: string;
-	preferredProvider: string;
+	backend: MultiModalBackendConfig;
 	signal?: AbortSignal;
 }
 
 interface AnalyzePdfOptions {
 	absolutePath: string;
-	preferredProvider: string;
+	backend: MultiModalBackendConfig;
 	signal?: AbortSignal;
 }
 
-interface AnalyzeWithPiBaseOptions {
+interface AnalyzeWithPiOptions {
 	attachmentPaths: string[];
 	prompt: string;
-	model: string;
+	backend: MultiModalBackendConfig;
 	signal?: AbortSignal;
 }
 
-interface AnalyzeWithPiOptions extends AnalyzeWithPiBaseOptions {
-	preferredProvider: string;
-}
-
-interface AnalyzeWithPiProviderOptions extends AnalyzeWithPiBaseOptions {
-	provider: string;
-}
-
-function resolvePreferredVisionProvider(modelRegistry: {
-	getAvailable(): Array<{ provider: string; id: string }>;
-}): string {
-	return pickPreferredVisionProvider(getAvailableVisionProviders(modelRegistry.getAvailable()));
-}
-
-async function analyzeWithPiProvider({
-	attachmentPaths,
-	prompt,
-	provider,
-	model,
-	signal,
-}: AnalyzeWithPiProviderOptions): Promise<string> {
+async function analyzeWithPi({ attachmentPaths, prompt, backend, signal }: AnalyzeWithPiOptions): Promise<string> {
 	return new Promise((resolvePromise, reject) => {
 		const args = [
 			...attachmentPaths.map((path) => `@${path}`),
 			"--provider",
-			provider,
+			backend.provider,
 			"--model",
-			model,
+			backend.model,
+			...(backend.thinkingLevel ? ["--thinking", backend.thinkingLevel] : []),
 			"--print",
-			"--json",
+			"--mode",
+			"json",
 			"--no-extensions",
 			"-p",
 			prompt,
@@ -520,40 +530,11 @@ async function analyzeWithPiProvider({
 	});
 }
 
-async function analyzeWithPi({
-	attachmentPaths,
-	prompt,
-	model,
-	preferredProvider,
-	signal,
-}: AnalyzeWithPiOptions): Promise<string> {
-	const providers = [
-		preferredProvider,
-		...VISION_PROVIDER_CANDIDATES.filter((provider) => provider !== preferredProvider),
-	];
-	let lastError: unknown;
-
-	for (const [index, provider] of providers.entries()) {
-		try {
-			return await analyzeWithPiProvider({ attachmentPaths, prompt, provider, model, signal });
-		} catch (error) {
-			lastError = error;
-			const hasFallback = index < providers.length - 1;
-			if (!hasFallback || !shouldRetryWithFallbackVisionProvider(error)) {
-				throw error;
-			}
-		}
-	}
-
-	throw lastError instanceof Error ? lastError : new Error(String(lastError));
-}
-
-async function analyzeImage({ absolutePath, preferredProvider, signal }: AnalyzeImageOptions): Promise<string> {
+async function analyzeImage({ absolutePath, backend, signal }: AnalyzeImageOptions): Promise<string> {
 	return analyzeWithPi({
 		attachmentPaths: [absolutePath],
 		prompt: IMAGE_ANALYSIS_PROMPT,
-		model: VISION_MODEL,
-		preferredProvider,
+		backend,
 		signal,
 	});
 }
@@ -608,8 +589,8 @@ async function extractPdfPages(absolutePath: string, pagesDir: string, signal?: 
 		.map((name) => join(pagesDir, name));
 }
 
-async function analyzePdf({ absolutePath, preferredProvider, signal }: AnalyzePdfOptions): Promise<string> {
-	const pagesDir = await mkdtemp(join(process.cwd(), ".glm-vision-pdf-"));
+async function analyzePdf({ absolutePath, backend, signal }: AnalyzePdfOptions): Promise<string> {
+	const pagesDir = await mkdtemp(join(process.cwd(), ".pi-multi-modal-pdf-"));
 	let succeeded = false;
 
 	try {
@@ -621,8 +602,7 @@ async function analyzePdf({ absolutePath, preferredProvider, signal }: AnalyzePd
 		const analysis = await analyzeWithPi({
 			attachmentPaths: pages,
 			prompt: `${PDF_ANALYSIS_PROMPT}\n\nThe attached images are rendered pages from a PDF in order.`,
-			model: VISION_MODEL,
-			preferredProvider,
+			backend,
 			signal,
 		});
 		succeeded = true;
@@ -742,8 +722,8 @@ async function extractVideoFrames(absolutePath: string, framesDir: string, signa
 		.map((name) => join(framesDir, name));
 }
 
-async function analyzeVideo({ absolutePath, preferredProvider, signal }: AnalyzeVideoOptions): Promise<string> {
-	const framesDir = await mkdtemp(join(process.cwd(), ".glm-vision-frames-"));
+async function analyzeVideo({ absolutePath, backend, signal }: AnalyzeVideoOptions): Promise<string> {
+	const framesDir = await mkdtemp(join(process.cwd(), ".pi-multi-modal-frames-"));
 	let succeeded = false;
 
 	try {
@@ -755,8 +735,7 @@ async function analyzeVideo({ absolutePath, preferredProvider, signal }: Analyze
 		const analysis = await analyzeWithPi({
 			attachmentPaths: frames,
 			prompt: VIDEO_ANALYSIS_PROMPT,
-			model: VISION_MODEL,
-			preferredProvider,
+			backend,
 			signal,
 		});
 		succeeded = true;
@@ -938,12 +917,12 @@ async function resolveInlineBashImageContent(
 	}
 
 	if (needsVisionProxy(ctx.model?.input)) {
-		const preferredProvider = resolvePreferredVisionProvider(ctx.modelRegistry);
+		const backend = await getMultiModalBackend();
 		const result = await analyzeMediaToolResult(absolutePath, {
 			image: true,
 			video: false,
 			pdf: false,
-			preferredProvider,
+			backend,
 			signal,
 		});
 		return result.content;
@@ -1228,21 +1207,44 @@ export default function (pi: ExtensionAPI) {
 				return localRead.execute(toolCallId, params, signal, onUpdate);
 			}
 
-			const preferredProvider = resolvePreferredVisionProvider(ctx.modelRegistry);
+			const backend = await getMultiModalBackend();
 			return analyzeMediaToolResult(absolutePath, {
 				image,
 				video,
 				pdf,
-				preferredProvider,
+				backend,
 				signal,
 				onUpdate,
 			});
 		},
 	});
 
+	pi.registerCommand("multi-modal", {
+		description: "Set the pi-multi-modal backend with /multi-modal <provider/model[:thinking]>",
+		handler: async (args, ctx) => {
+			const parsed = parseMultiModalBackend(args);
+			if (!parsed) {
+				ctx.ui.notify(
+					`Usage: /multi-modal <provider/model[:thinking]> (default: ${formatMultiModalBackend(DEFAULT_MULTI_MODAL_BACKEND)})`,
+					"error",
+				);
+				return;
+			}
+
+			const model = ctx.modelRegistry.find(parsed.provider, parsed.model);
+			if (model && !supportsNativeImageInput(model.input)) {
+				ctx.ui.notify(`Model does not support image input: ${formatMultiModalBackend(parsed)}`, "error");
+				return;
+			}
+
+			await saveMultiModalBackend(parsed);
+			ctx.ui.notify(`pi-multi-modal backend set to ${formatMultiModalBackend(parsed)}`, "info");
+		},
+	});
+
 	// Command for manual image analysis
 	pi.registerCommand("analyze-image", {
-		description: `Analyze an image file using ${VISION_MODEL}`,
+		description: "Analyze an image file using the configured pi-multi-modal backend",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("analyze-image requires interactive mode", "error");
@@ -1262,12 +1264,12 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const preferredProvider = resolvePreferredVisionProvider(ctx.modelRegistry);
+			const backend = await getMultiModalBackend();
 			const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
 				const loader = new BorderedLoader(tui, theme, `Analyzing ${imagePath}...`);
 				loader.onAbort = () => done(null);
 
-				analyzeImage({ absolutePath, preferredProvider, signal: loader.signal })
+				analyzeImage({ absolutePath, backend, signal: loader.signal })
 					.then((text) => done(text))
 					.catch((err) => {
 						ctx.ui.notify(`Analysis failed: ${err.message}`, "error");
@@ -1288,7 +1290,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Command for manual video analysis
 	pi.registerCommand("analyze-video", {
-		description: `Analyze a video file using ${VISION_MODEL}`,
+		description: "Analyze a video file using the configured pi-multi-modal backend",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("analyze-video requires interactive mode", "error");
@@ -1307,12 +1309,12 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const preferredProvider = resolvePreferredVisionProvider(ctx.modelRegistry);
+			const backend = await getMultiModalBackend();
 			const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
 				const loader = new BorderedLoader(tui, theme, `Analyzing ${videoPath}...`);
 				loader.onAbort = () => done(null);
 
-				analyzeVideo({ absolutePath, preferredProvider, signal: loader.signal })
+				analyzeVideo({ absolutePath, backend, signal: loader.signal })
 					.then((text) => done(text))
 					.catch((err) => {
 						ctx.ui.notify(`Analysis failed: ${err.message}`, "error");

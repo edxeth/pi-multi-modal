@@ -1,11 +1,11 @@
 {
-	"name": "pi-glm-image-summary",
+	"name": "pi-multi-modal",
 	"version": "0.1.4",
 	"type": "module",
-	"description": "Pi extension that proxies media analysis through glm-4.6v for models without native image support",
+	"description": "Pi extension that proxies local media analysis through a configurable backend for models without native image support",
 	"keywords": [
 		"pi-package",
-		"glm",
+		"multi-modal",
 		"image",
 		"vision",
 		"ai"

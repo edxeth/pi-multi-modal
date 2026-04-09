@@ -1,24 +1,26 @@
 /**
- * Utility functions for GLM Image Summary Extension
- * Extracted for testability
+ * Utility functions for pi-multi-modal.
  */
 
-import { spawn } from "node:child_process";
-
-// Configuration
-export const VISION_PROVIDER = "zai";
-export const VISION_PROVIDER_FALLBACK = "zai-legacy";
-export const VISION_PROVIDER_CANDIDATES = [VISION_PROVIDER, VISION_PROVIDER_FALLBACK] as const;
-export const VISION_MODEL = "glm-4.6v";
+export const DEFAULT_MULTI_MODAL_PROVIDER = "zai";
+export const DEFAULT_MULTI_MODAL_MODEL = "glm-4.6v";
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+export interface MultiModalBackendConfig {
+	provider: string;
+	model: string;
+	thinkingLevel?: ThinkingLevel;
+}
+export const DEFAULT_MULTI_MODAL_BACKEND: MultiModalBackendConfig = {
+	provider: DEFAULT_MULTI_MODAL_PROVIDER,
+	model: DEFAULT_MULTI_MODAL_MODEL,
+};
 export const SUPPORTED_IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp"];
 export const SUPPORTED_VIDEO_EXTENSIONS = ["mp4", "mkv", "mov"];
 export const SUPPORTED_PDF_EXTENSIONS = ["pdf"];
 const INLINE_IMAGE_PATH_REGEX = /(^|\s|\(|:|\[)(@?((?:~|\/|\.\.?\/)[^\s)\]}"']+\.(?:jpg|jpeg|png|gif|webp)))/gim;
 const INLINE_EXPLICIT_MEDIA_PATH_REGEX = /(^|\s|\(|:|\[)(@((?:~|\/|\.\.?\/)[^\s)\]}"']+\.[a-z0-9]+))/gim;
-const VISION_PROVIDER_RETRYABLE_ERROR_REGEX =
-	/no api key found|unknown provider|no models matching|no models available|unknown model/i;
 export const PI_BASH_IMAGE_MARKER_PREFIX = "__PI_IMAGE_MARKER__:";
-let resolvedVisionProviderPromise: Promise<string> | undefined;
 
 export type ImageReferenceMatch =
 	| {
@@ -61,76 +63,60 @@ export type BashImageOutputPart =
 			path: string;
 	  };
 
-function escapeRegExp(text: string): string {
-	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+export function isThinkingLevel(value: string | undefined): value is ThinkingLevel {
+	return value !== undefined && THINKING_LEVELS.includes(value as ThinkingLevel);
 }
 
-export function extractAvailableVisionProviders(output: string, model = VISION_MODEL): string[] {
-	const matches = output.matchAll(new RegExp(`^(\\S+)\\s+${escapeRegExp(model)}(?=\\s|$)`, "gm"));
-	const providers = [...matches]
-		.map((match) => match[1])
-		.filter((provider): provider is string => provider !== undefined);
-	return [...new Set(providers.filter((provider) => VISION_PROVIDER_CANDIDATES.includes(provider as never)))];
-}
+export function parseMultiModalBackend(input: string): MultiModalBackendConfig | null {
+	const trimmed = input.trim();
+	const slashIndex = trimmed.indexOf("/");
+	if (slashIndex <= 0 || slashIndex >= trimmed.length - 1) {
+		return null;
+	}
 
-export function getAvailableVisionProviders(
-	models: ReadonlyArray<{ provider: string; id: string }>,
-	model = VISION_MODEL,
-): string[] {
-	const providers = models
-		.filter((entry) => entry.id === model)
-		.map((entry) => entry.provider)
-		.filter((provider) => VISION_PROVIDER_CANDIDATES.includes(provider as never));
-	return [...new Set(providers)];
-}
+	const provider = trimmed.slice(0, slashIndex).trim();
+	let model = trimmed.slice(slashIndex + 1).trim();
+	if (!provider || !model) {
+		return null;
+	}
 
-export function pickPreferredVisionProvider(providers: readonly string[]): string {
-	for (const provider of VISION_PROVIDER_CANDIDATES) {
-		if (providers.includes(provider)) {
-			return provider;
+	let thinkingLevel: ThinkingLevel | undefined;
+	const thinkingSeparatorIndex = model.lastIndexOf(":");
+	if (thinkingSeparatorIndex > 0) {
+		const maybeThinkingLevel = model.slice(thinkingSeparatorIndex + 1).trim();
+		if (isThinkingLevel(maybeThinkingLevel)) {
+			thinkingLevel = maybeThinkingLevel;
+			model = model.slice(0, thinkingSeparatorIndex).trim();
 		}
 	}
-	return VISION_PROVIDER;
+
+	if (!model) {
+		return null;
+	}
+
+	return thinkingLevel ? { provider, model, thinkingLevel } : { provider, model };
 }
 
-export function shouldRetryWithFallbackVisionProvider(error: unknown): boolean {
-	const message = error instanceof Error ? error.message : String(error);
-	return VISION_PROVIDER_RETRYABLE_ERROR_REGEX.test(message);
+export function formatMultiModalBackend(config: MultiModalBackendConfig): string {
+	return `${config.provider}/${config.model}${config.thinkingLevel ? `:${config.thinkingLevel}` : ""}`;
 }
 
-async function listAvailableVisionProviders(): Promise<string[]> {
-	return new Promise((resolvePromise) => {
-		const child = spawn("pi", ["--no-extensions", "--list-models", VISION_MODEL], {
-			stdio: ["ignore", "pipe", "pipe"],
-			env: process.env,
-		});
-
-		let stdout = "";
-		let stderr = "";
-
-		child.stdout.on("data", (data: Buffer) => {
-			stdout += data.toString();
-		});
-
-		child.stderr.on("data", (data: Buffer) => {
-			stderr += data.toString();
-		});
-
-		child.on("error", () => {
-			resolvePromise([]);
-		});
-
-		child.on("close", () => {
-			resolvePromise(extractAvailableVisionProviders(`${stdout}\n${stderr}`));
-		});
-	});
+function readStringSetting(settings: unknown, path: readonly string[]): string | undefined {
+	let current: unknown = settings;
+	for (const key of path) {
+		if (current === null || typeof current !== "object" || !(key in current)) {
+			return undefined;
+		}
+		current = (current as Record<string, unknown>)[key];
+	}
+	return typeof current === "string" ? current : undefined;
 }
 
-export async function resolveVisionProvider(): Promise<string> {
-	resolvedVisionProviderPromise ??= listAvailableVisionProviders().then((providers) =>
-		pickPreferredVisionProvider(providers),
-	);
-	return resolvedVisionProviderPromise;
+export function readMultiModalBackendSetting(settings: unknown): MultiModalBackendConfig {
+	const provider = readStringSetting(settings, ["multiModal", "provider"]) ?? DEFAULT_MULTI_MODAL_BACKEND.provider;
+	const model = readStringSetting(settings, ["multiModal", "model"]) ?? DEFAULT_MULTI_MODAL_BACKEND.model;
+	const thinkingLevel = readStringSetting(settings, ["multiModal", "thinkingLevel"]);
+	return isThinkingLevel(thinkingLevel) ? { provider, model, thinkingLevel } : { provider, model };
 }
 
 export function parseBashImageOutput(text: string): { parts: BashImageOutputPart[]; foundMarkers: boolean } {
@@ -367,20 +353,77 @@ export function resolveShowImagesSetting(globalSettings: unknown, projectSetting
  * Extract text content from pi JSON output
  * Falls back to returning the raw output if not valid JSON
  */
-export function extractTextFromPiOutput(output: string): string {
-	try {
-		const json: PiJsonOutput = JSON.parse(output);
-		if (json.messages && Array.isArray(json.messages)) {
-			const assistantMsg = json.messages.findLast((m: PiMessage) => m.role === "assistant");
-			if (assistantMsg?.content) {
-				return assistantMsg.content
-					.filter((c: PiContentBlock) => c.type === "text")
-					.map((c: PiContentBlock) => c.text ?? "")
-					.join("\n");
+function extractTextFromAssistantContent(content: unknown): string | null {
+	if (!Array.isArray(content)) {
+		return null;
+	}
+
+	const text = content
+		.filter((block): block is PiContentBlock => Boolean(block) && typeof block === "object" && "type" in block)
+		.filter((block) => block.type === "text")
+		.map((block) => block.text ?? "")
+		.join("\n");
+
+	return text || null;
+}
+
+function extractTextFromPiJson(json: unknown): string | null {
+	if (!json || typeof json !== "object") {
+		return null;
+	}
+
+	if ("messages" in json && Array.isArray((json as PiJsonOutput).messages)) {
+		const assistantMsg = (json as PiJsonOutput).messages?.findLast((m: PiMessage) => m.role === "assistant");
+		const text = extractTextFromAssistantContent(assistantMsg?.content);
+		if (text) {
+			return text;
+		}
+	}
+
+	if ("type" in json && (json as { type?: unknown }).type === "agent_end") {
+		const text = extractTextFromPiJson({ messages: (json as { messages?: unknown }).messages });
+		if (text) {
+			return text;
+		}
+	}
+
+	if ("message" in json) {
+		const message = (json as { message?: unknown }).message;
+		if (message && typeof message === "object" && (message as { role?: unknown }).role === "assistant") {
+			const text = extractTextFromAssistantContent((message as { content?: unknown }).content);
+			if (text) {
+				return text;
 			}
 		}
-	} catch {
-		// Not JSON, return as-is
 	}
+
+	return null;
+}
+
+export function extractTextFromPiOutput(output: string): string {
+	try {
+		const text = extractTextFromPiJson(JSON.parse(output));
+		if (text) {
+			return text;
+		}
+	} catch {
+		// Not a single JSON object; try newline-delimited JSON below.
+	}
+
+	const lines = output
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean);
+	for (let i = lines.length - 1; i >= 0; i -= 1) {
+		try {
+			const text = extractTextFromPiJson(JSON.parse(lines[i]!));
+			if (text) {
+				return text;
+			}
+		} catch {
+			// Ignore non-JSON lines.
+		}
+	}
+
 	return output;
 }

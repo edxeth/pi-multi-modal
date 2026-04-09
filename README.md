@@ -1,11 +1,11 @@
 # pi-multi-modal
 
-A [pi](https://github.com/badlogic/pi-mono) extension for local media paths.
+A [pi](https://github.com/badlogic/pi-mono) extension for local image, video, and PDF paths.
 
 It does three jobs depending on the active model and workflow:
 
 - **Models with native image input**: explicit `@./image.png` paths are attached as real image inputs.
-- **Models without native image input**: explicit `@./image.png`, `@./video.mp4`, or `@./file.pdf` paths opt into GLM-based media analysis when the agent reads that same file.
+- **Models without native image input**: explicit `@./image.png`, `@./video.mp4`, or `@./file.pdf` paths opt into media analysis when the agent reads that same file.
 - **Bash image workflows**: the bash tool gets a built-in `__PI_IMAGE__` helper so any command that creates a local image file can return it inline in the same tool result.
 
 ## Behavior
@@ -38,15 +38,10 @@ Review @./report.pdf
 What happens:
 - the `@path` marks that file as intentionally analyzable media
 - if the agent later uses the `read` tool on that same path, the extension intercepts it
-- the file is analyzed with `glm-4.6v`
+- the file is analyzed with the configured pi-multi-modal backend
 - the agent receives a structured summary instead of raw file contents
 
-Plain paths without `@` are left alone. That means requests like these stay safe:
-
-```text
-Add ./preview-1.png and ./preview-2.png to my README
-List all image paths mentioned in this document
-```
+Plain paths without `@` are left alone.
 
 ### 3) Inline bash images
 
@@ -57,27 +52,50 @@ python make-chart.py && __PI_IMAGE__ chart.png
 my-tool-that-generates-an-image && __PI_IMAGE__ output.png
 ```
 
-`agent-browser` is just one example of this pattern.
-
 What happens:
 - the helper emits markers for real local image paths
 - pi-multi-modal replaces those markers before the model sees the tool result
 - vision models receive the actual image block inline
-- non-vision models receive an inline `glm-4.6v` image analysis instead
+- non-vision models receive an inline analysis from the configured backend instead
 
-## Vision backend
+## Backend configuration
 
-Media proxy analysis uses:
+Default backend:
 
-- provider: `zai` when available, otherwise `zai-legacy`
-- model: `glm-4.6v`
+```text
+zai/glm-4.6v
+```
 
-Provider selection is resolved from the current pi instance without the slow `pi --list-models` subprocess probe.
+Set a different backend in interactive mode:
+
+```text
+/multi-modal zai/glm-4.6v
+/multi-modal google/gemini-3-flash-preview:high
+```
+
+This saves to `~/.pi/agent/settings.json` under:
+
+```json
+{
+  "multiModal": {
+    "provider": "google",
+    "model": "gemini-3-flash-preview",
+    "thinkingLevel": "high"
+  }
+}
+```
+
+If `:thinking` is omitted, pi-multi-modal does not pass `--thinking` to the backend subprocess.
+
+Requirements for the configured backend:
+- the model must exist in Pi's model registry
+- the model must support image input
 
 ## Features
 
 - explicit `@path` handling for native image-input models
 - explicit opt-in media analysis for non-vision models
+- configurable backend via `/multi-modal`
 - inline bash image ingestion via `__PI_IMAGE__`
 - image classification for screenshots, diagrams, charts, and general images
 - video analysis via local keyframe extraction with `ffmpeg`
@@ -110,12 +128,6 @@ pi -e git:github.com/edxeth/pi-multi-modal
 
 Example with a vision-capable model:
 
-```bash
-pi --provider zai-messages --model glm-5
-```
-
-Then in the prompt:
-
 ```text
 Compare @./before.png and @./after.png
 ```
@@ -126,7 +138,7 @@ Example with a non-vision model:
 Analyze @./screenshot.png and explain the error
 ```
 
-If the agent reads `./screenshot.png`, the extension routes that read through `glm-4.6v`.
+If the agent reads `./screenshot.png`, the extension routes that read through the configured backend.
 
 `agent-browser` example in one bash result:
 
@@ -145,19 +157,10 @@ agent-browser open https://example.com \
 - GIF (`.gif`)
 - WebP (`.webp`)
 
-### Non-vision media proxy path
+### Media analysis path
 - Images: `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`
 - Videos: `.mp4`, `.mkv`, `.mov`
 - PDFs: `.pdf`
-
-## Configuration
-
-```text
-provider = zai | zai-legacy
-model = glm-4.6v
-```
-
-The extension prefers `zai` and falls back to `zai-legacy`.
 
 Video analysis requires `ffmpeg` and `ffprobe` in `PATH`.
 PDF analysis requires `gs` (Ghostscript) in `PATH`.
@@ -166,9 +169,8 @@ PDF analysis requires `gs` (Ghostscript) in `PATH`.
 
 ```bash
 npm install
-npm run check
 npm test
-npm run test:integration
+npx tsc --noEmit
 ```
 
 See [test-fixtures/README.md](./test-fixtures/README.md) for fixture details and benchmarks.
