@@ -1017,6 +1017,11 @@ export default function (pi: ExtensionAPI) {
 		handler: handleSmartPaste,
 	});
 
+	pi.registerShortcut("f12", {
+		description: "Internal smart paste dispatch",
+		handler: handleSmartPaste,
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.hasUI) {
 			setWeztermUserVar("PI_SMART_PASTE", "1");
