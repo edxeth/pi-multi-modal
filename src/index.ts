@@ -1029,12 +1029,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_switch", async (_event, ctx) => {
-		if (ctx.hasUI) {
-			attachmentIndicatorController.attach(ctx as AttachmentIndicatorCtx);
-		}
-	});
-
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (ctx.hasUI) {
 			setWeztermUserVar("PI_SMART_PASTE", "0");
