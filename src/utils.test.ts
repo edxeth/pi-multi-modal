@@ -3,6 +3,7 @@ import {
 	buildImageReferenceSuffix,
 	colorizeImagePlaceholders,
 	DEFAULT_MULTI_MODAL_BACKEND,
+	extractErrorFromPiOutput,
 	extractTextFromPiOutput,
 	findExplicitImagePaths,
 	findExplicitMediaPaths,
@@ -297,6 +298,28 @@ describe("resolveShowImagesSetting", () => {
 
 	it("falls back to global setting when project setting is absent", () => {
 		expect(resolveShowImagesSetting({ terminal: { showImages: false } }, {})).toBe(false);
+	});
+});
+
+describe("extractErrorFromPiOutput", () => {
+	it("extracts an assistant errorMessage from JSON output", () => {
+		const jsonOutput = JSON.stringify({
+			messages: [{ role: "assistant", content: [], errorMessage: "429 insufficient balance" }],
+		});
+		expect(extractErrorFromPiOutput(jsonOutput)).toBe("429 insufficient balance");
+	});
+
+	it("extracts the finalError from ndjson output", () => {
+		const output = [
+			JSON.stringify({ type: "session" }),
+			JSON.stringify({ type: "auto_retry_end", success: false, finalError: "backend failed" }),
+		].join("\n");
+		expect(extractErrorFromPiOutput(output)).toBe("backend failed");
+	});
+
+	it("returns null when there is no structured error", () => {
+		expect(extractErrorFromPiOutput(JSON.stringify({ messages: [] }))).toBeNull();
+		expect(extractErrorFromPiOutput("plain text")).toBeNull();
 	});
 });
 

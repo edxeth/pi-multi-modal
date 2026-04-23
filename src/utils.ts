@@ -400,6 +400,74 @@ function extractTextFromPiJson(json: unknown): string | null {
 	return null;
 }
 
+function extractErrorFromPiJson(json: unknown): string | null {
+	if (!json || typeof json !== "object") {
+		return null;
+	}
+
+	if ("finalError" in json && typeof (json as { finalError?: unknown }).finalError === "string") {
+		const finalError = (json as { finalError: string }).finalError.trim();
+		if (finalError) {
+			return finalError;
+		}
+	}
+
+	if ("errorMessage" in json && typeof (json as { errorMessage?: unknown }).errorMessage === "string") {
+		const errorMessage = (json as { errorMessage: string }).errorMessage.trim();
+		if (errorMessage) {
+			return errorMessage;
+		}
+	}
+
+	if ("messages" in json && Array.isArray((json as PiJsonOutput).messages)) {
+		const assistantMsg = (json as PiJsonOutput).messages?.findLast((m: PiMessage) => m.role === "assistant") as
+			| (PiMessage & { errorMessage?: unknown })
+			| undefined;
+		if (typeof assistantMsg?.errorMessage === "string" && assistantMsg.errorMessage.trim()) {
+			return assistantMsg.errorMessage.trim();
+		}
+	}
+
+	if ("message" in json) {
+		const message = (json as { message?: unknown }).message as
+			| ({ role?: unknown; errorMessage?: unknown } & Record<string, unknown>)
+			| undefined;
+		if (message?.role === "assistant" && typeof message.errorMessage === "string" && message.errorMessage.trim()) {
+			return message.errorMessage.trim();
+		}
+	}
+
+	return null;
+}
+
+export function extractErrorFromPiOutput(output: string): string | null {
+	try {
+		const error = extractErrorFromPiJson(JSON.parse(output));
+		if (error) {
+			return error;
+		}
+	} catch {
+		// Not a single JSON object; try newline-delimited JSON below.
+	}
+
+	const lines = output
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean);
+	for (let i = lines.length - 1; i >= 0; i -= 1) {
+		try {
+			const error = extractErrorFromPiJson(JSON.parse(lines[i]!));
+			if (error) {
+				return error;
+			}
+		} catch {
+			// Ignore non-JSON lines.
+		}
+	}
+
+	return null;
+}
+
 export function extractTextFromPiOutput(output: string): string {
 	try {
 		const text = extractTextFromPiJson(JSON.parse(output));

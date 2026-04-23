@@ -18,6 +18,7 @@ import { type Component, Container, Image, Spacer, Text } from "@mariozechner/pi
 import { extensionForImageMimeType, readClipboardImage } from "./clipboard-image.js";
 import {
 	DEFAULT_MULTI_MODAL_BACKEND,
+	extractErrorFromPiOutput,
 	extractTextFromPiOutput,
 	findExplicitImagePaths,
 	findExplicitMediaPaths,
@@ -512,9 +513,23 @@ async function analyzeWithPi({ attachmentPaths, prompt, backend, signal }: Analy
 		child.on("close", (code: number | null) => {
 			if (code !== 0) {
 				reject(new Error(`pi subprocess failed (${code}): ${stderr}`));
-			} else {
-				resolvePromise(extractTextFromPiOutput(stdout.trim()));
+				return;
 			}
+
+			const output = stdout.trim();
+			const error = extractErrorFromPiOutput(output);
+			if (error) {
+				reject(new Error(error));
+				return;
+			}
+
+			const text = extractTextFromPiOutput(output);
+			if (text === output && output.startsWith("{")) {
+				reject(new Error("pi subprocess returned no assistant text"));
+				return;
+			}
+
+			resolvePromise(text);
 		});
 
 		if (signal) {
