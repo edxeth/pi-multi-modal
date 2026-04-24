@@ -58,6 +58,36 @@ What happens:
 - vision models receive the actual image block inline
 - non-vision models receive an inline analysis from the configured backend instead
 
+## TIA compatibility
+
+If you run pi through TIA and keep TIA's `fast-tools.ts` enabled, set:
+
+```bash
+export PI_MULTI_MODAL_WRAP_EXISTING_TOOLS=1
+```
+
+In this mode, pi-multi-modal does **not** register public `read` or `bash` tools. TIA keeps ownership of those fast tools, and pi-multi-modal wraps them through pi's tool events:
+
+- normal text `read` stays on TIA's fast `read`
+- normal/safe `bash` stays on TIA's fast `bash`
+- image/video/PDF `read` results are replaced with pi-multi-modal media-aware results when applicable
+- `bash` commands using `__PI_IMAGE__` get the helper preamble and marker processing
+
+This avoids duplicate `read`/`bash` tool conflicts while preserving media handling.
+
+Example shell setup:
+
+```bash
+export PI_MULTI_MODAL_WRAP_EXISTING_TOOLS=1
+alias pi='tia pi'
+alias p='tia pi'
+```
+
+Notes:
+- explicit media analysis still uses `@path` opt-in semantics for non-vision models
+- video analysis requires explicit media references such as `@./demo.mp4`
+- the internal media-analysis subprocess clears inherited `PI_PACKAGE_DIR` so it can run normal pi correctly under TIA
+
 ## Backend configuration
 
 Default backend:

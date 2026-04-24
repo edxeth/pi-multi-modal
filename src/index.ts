@@ -8,6 +8,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -164,6 +165,7 @@ const BASH_IMAGE_PREAMBLE = [
 type ToolTextBlock = { type: "text"; text: string };
 type ToolContentBlock = ToolTextBlock | ImageContent;
 type ToolResult = { content: ToolContentBlock[]; details: Record<string, never> };
+type ReadParams = { path: string; offset?: number; limit?: number };
 type AttachmentIndicatorCtx = {
 	cwd: string;
 	ui: {
@@ -204,6 +206,158 @@ function resolveUserPath(cwd: string, inputPath: string): string {
 		return join(homedir(), inputPath.slice(2));
 	}
 	return resolve(cwd, inputPath);
+}
+
+function envFlagEnabled(name: string): boolean {
+	return /^(1|true|yes|on)$/i.test(process.env[name] ?? "");
+}
+
+function wrapExistingToolsEnabled(): boolean {
+	return envFlagEnabled("PI_MULTI_MODAL_WRAP_EXISTING_TOOLS");
+}
+
+function fastHelpersEnabled(): boolean {
+	return envFlagEnabled("PI_MULTI_MODAL_FAST_HELPERS");
+}
+
+function fastToolsDir(): string {
+	return process.env.PI_MULTI_MODAL_FAST_TOOLS_DIR ?? join(getAgentDir(), "fast-tools");
+}
+
+function fastToolPath(name: string): string {
+	return join(fastToolsDir(), name);
+}
+
+function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+	return signal?.aborted || (error instanceof Error && error.name === "AbortError");
+}
+
+async function runFastBinaryCapture(cmd: string, args: string[], signal?: AbortSignal): Promise<string> {
+	const proc = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], signal });
+	let stdout = "";
+	let stderr = "";
+
+	proc.stdout.setEncoding("utf8");
+	proc.stderr.setEncoding("utf8");
+	proc.stdout.on("data", (chunk) => {
+		stdout += chunk;
+	});
+	proc.stderr.on("data", (chunk) => {
+		stderr += chunk;
+	});
+
+	const code = await new Promise<number | null>((resolve, reject) => {
+		proc.once("error", reject);
+		proc.once("exit", resolve);
+	});
+
+	if (code !== 0) {
+		throw new Error(stderr.trim() || `${cmd} exited with code ${code}`);
+	}
+
+	return stdout;
+}
+
+async function tryFastTextRead(
+	cwd: string,
+	params: ReadParams,
+	signal?: AbortSignal,
+): Promise<{ content: ToolTextBlock[]; details: undefined } | undefined> {
+	if (!fastHelpersEnabled()) {
+		return undefined;
+	}
+
+	const bin = fastToolPath("fastread-window");
+	if (!existsSync(bin)) {
+		return undefined;
+	}
+
+	const absolutePath = resolveUserPath(cwd, params.path);
+	const startLine = Math.max(1, params.offset ?? 1);
+	const maxLines = Math.max(1, params.limit ?? 2000);
+
+	try {
+		const text = await runFastBinaryCapture(bin, [absolutePath, String(startLine), String(maxLines)], signal);
+		return { content: [{ type: "text", text }], details: undefined };
+	} catch (error) {
+		if (isAbortError(error, signal)) {
+			throw error;
+		}
+		return undefined;
+	}
+}
+
+async function tryFastBash(
+	cwd: string,
+	command: string,
+	signal?: AbortSignal,
+): Promise<{ content: ToolTextBlock[]; details: undefined } | undefined> {
+	if (!fastHelpersEnabled() || command.includes("__PI_IMAGE__") || command.includes(PI_BASH_IMAGE_MARKER_PREFIX)) {
+		return undefined;
+	}
+
+	const fastDrain = fastToolPath("fastdrain");
+	const fastCopy = fastToolPath("fastcopy");
+	if (!existsSync(fastDrain) || !existsSync(fastCopy)) {
+		return undefined;
+	}
+
+	const steps: Array<() => Promise<void>> = [];
+	const parts = command
+		.split("&&")
+		.map((part) => part.trim())
+		.filter(Boolean);
+	if (parts.length === 0) {
+		return undefined;
+	}
+
+	for (const part of parts) {
+		const catMatch = part.match(/^cat\s+(\S+)\s*>\s*\/dev\/null$/);
+		if (catMatch) {
+			const file = resolveUserPath(cwd, catMatch[1]);
+			steps.push(async () => {
+				await runFastBinaryCapture(fastDrain, [file], signal);
+			});
+			continue;
+		}
+
+		const cpMatch = part.match(/^cp\s+(\S+)\s+(\S+)$/);
+		if (cpMatch) {
+			const src = resolveUserPath(cwd, cpMatch[1]);
+			const dst = resolveUserPath(cwd, cpMatch[2]);
+			steps.push(async () => {
+				await mkdir(dirname(dst), { recursive: true });
+				await runFastBinaryCapture(fastCopy, [src, dst], signal);
+			});
+			continue;
+		}
+
+		const rmMatch = part.match(/^rm\s+(\S+)$/);
+		if (rmMatch) {
+			const target = resolveUserPath(cwd, rmMatch[1]);
+			steps.push(async () => {
+				await rm(target, { force: true });
+			});
+			continue;
+		}
+
+		return undefined;
+	}
+
+	try {
+		for (const step of steps) {
+			if (signal?.aborted) {
+				throw new Error("Operation aborted");
+			}
+			await step();
+		}
+		return { content: [{ type: "text", text: "(no output)" }], details: undefined };
+	} catch (error) {
+		if (isAbortError(error, signal)) {
+			throw error;
+		}
+		return undefined;
+	}
 }
 
 async function loadImageAttachment(cwd: string, inputPath: string): Promise<ImageContent | null> {
@@ -490,9 +644,12 @@ async function analyzeWithPi({ attachmentPaths, prompt, backend, signal }: Analy
 			prompt,
 		];
 
+		const childEnv = { ...process.env };
+		delete childEnv.PI_PACKAGE_DIR;
+
 		const child = spawn("pi", args, {
 			stdio: ["ignore", "pipe", "pipe"],
-			env: process.env,
+			env: childEnv,
 		});
 
 		let stdout = "";
@@ -1062,22 +1219,89 @@ export default function (pi: ExtensionAPI) {
 		},
 	);
 
-	pi.registerTool({
-		...localBash,
-		description: `${localBash.description} ${BASH_IMAGE_GUIDELINE}`,
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const result = await localBash.execute(toolCallId, params, signal, onUpdate);
-			const processed = await processBashResult(result as { content: ToolContentBlock[]; details?: unknown }, {
-				localRead,
-				ctx,
-				signal,
-			});
+	if (wrapExistingToolsEnabled()) {
+		pi.on("tool_call", (event) => {
+			if (event.toolName !== "bash") {
+				return;
+			}
+
+			const input = event.input as { command?: unknown };
+			if (typeof input.command !== "string" || !input.command.includes("__PI_IMAGE__")) {
+				return;
+			}
+			if (input.command.includes(PI_BASH_IMAGE_MARKER_PREFIX)) {
+				return;
+			}
+
+			input.command = `${BASH_IMAGE_PREAMBLE}\n${input.command}`;
+		});
+
+		pi.on("tool_result", async (event, ctx) => {
+			if (event.toolName === "read") {
+				const params = event.input as Partial<ReadParams>;
+				if (typeof params.path !== "string") {
+					return undefined;
+				}
+
+				const absolutePath = resolveUserPath(ctx.cwd, params.path);
+				const image = isImageFile(absolutePath);
+				const video = isVideoFile(absolutePath);
+				const pdf = isPdfFile(absolutePath);
+				if (!image && !video && !pdf) {
+					return undefined;
+				}
+
+				if (needsVisionProxy(ctx.model?.input) && explicitMediaAnalysisPaths.has(absolutePath)) {
+					const backend = await getMultiModalBackend();
+					const result = await analyzeMediaToolResult(absolutePath, {
+						image,
+						video,
+						pdf,
+						backend,
+					});
+					return { content: result.content, details: result.details };
+				}
+
+				const result = await localRead.execute("multi-modal-read", params as ReadParams, undefined, undefined);
+				return { content: result.content, details: result.details };
+			}
+
+			if (event.toolName !== "bash") {
+				return undefined;
+			}
+
+			const processed = await processBashResult(
+				{ content: event.content as ToolContentBlock[], details: event.details },
+				{ localRead, ctx },
+			);
 			if (!processed.foundMarkers) {
-				return result;
+				return undefined;
 			}
 			return { content: processed.content, details: processed.details };
-		},
-	});
+		});
+	} else {
+		pi.registerTool({
+			...localBash,
+			description: `${localBash.description} ${BASH_IMAGE_GUIDELINE}`,
+			async execute(toolCallId, params, signal, onUpdate, ctx) {
+				const fastResult = await tryFastBash(ctx.cwd, params.command, signal);
+				if (fastResult) {
+					return fastResult;
+				}
+
+				const result = await localBash.execute(toolCallId, params, signal, onUpdate);
+				const processed = await processBashResult(result as { content: ToolContentBlock[]; details?: unknown }, {
+					localRead,
+					ctx,
+					signal,
+				});
+				if (!processed.foundMarkers) {
+					return result;
+				}
+				return { content: processed.content, details: processed.details };
+			},
+		});
+	}
 
 	pi.on("turn_end", () => {
 		explicitMediaAnalysisPaths = new Set<string>();
@@ -1204,34 +1428,44 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Override read to intercept image/video/PDF reads for non-vision models
-	pi.registerTool({
-		...localRead,
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const { path } = params;
-			const absolutePath = resolveUserPath(ctx.cwd, path);
-			const image = isImageFile(absolutePath);
-			const video = isVideoFile(absolutePath);
-			const pdf = isPdfFile(absolutePath);
+	if (!wrapExistingToolsEnabled()) {
+		pi.registerTool({
+			...localRead,
+			async execute(toolCallId, params, signal, onUpdate, ctx) {
+				const { path } = params;
+				const absolutePath = resolveUserPath(ctx.cwd, path);
+				const image = isImageFile(absolutePath);
+				const video = isVideoFile(absolutePath);
+				const pdf = isPdfFile(absolutePath);
 
-			if (!needsVisionProxy(ctx.model?.input) || (!image && !video && !pdf)) {
-				return localRead.execute(toolCallId, params, signal, onUpdate);
-			}
+				if (!image && !video && !pdf) {
+					const fastResult = await tryFastTextRead(ctx.cwd, params, signal);
+					if (fastResult) {
+						return fastResult;
+					}
+					return localRead.execute(toolCallId, params, signal, onUpdate);
+				}
 
-			if (!explicitMediaAnalysisPaths.has(absolutePath)) {
-				return localRead.execute(toolCallId, params, signal, onUpdate);
-			}
+				if (!needsVisionProxy(ctx.model?.input)) {
+					return localRead.execute(toolCallId, params, signal, onUpdate);
+				}
 
-			const backend = await getMultiModalBackend();
-			return analyzeMediaToolResult(absolutePath, {
-				image,
-				video,
-				pdf,
-				backend,
-				signal,
-				onUpdate,
-			});
-		},
-	});
+				if (!explicitMediaAnalysisPaths.has(absolutePath)) {
+					return localRead.execute(toolCallId, params, signal, onUpdate);
+				}
+
+				const backend = await getMultiModalBackend();
+				return analyzeMediaToolResult(absolutePath, {
+					image,
+					video,
+					pdf,
+					backend,
+					signal,
+					onUpdate,
+				});
+			},
+		});
+	}
 
 	pi.registerCommand("multi-modal", {
 		description: "Set the pi-multi-modal backend with /multi-modal <provider/model[:thinking]>",
