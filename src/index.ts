@@ -190,6 +190,7 @@ type AttachmentIndicatorCtx = {
 
 const ATTACHMENT_INDICATOR_WIDGET_KEY = "multi-modal-attachment-indicator";
 const ATTACHMENT_INDICATOR_POLL_MS = 250;
+const EXPLICIT_MEDIA_ANALYSIS_CONCURRENCY = 3;
 
 function mimeTypeForImagePath(path: string): ImageContent["mimeType"] | undefined {
 	const ext = path.split(".").pop()?.toLowerCase();
@@ -1187,7 +1188,11 @@ async function analyzeExplicitMediaReferences(
 		backend: MultiModalBackendConfig;
 	},
 ): Promise<string> {
-	const sections: string[] = [];
+	const references: Array<{
+		path: string;
+		absolutePath: string;
+		flags: { image: boolean; video: boolean; pdf: boolean };
+	}> = [];
 	const seen = new Set<string>();
 
 	for (const path of paths) {
@@ -1201,26 +1206,41 @@ async function analyzeExplicitMediaReferences(
 		if (!flags) {
 			continue;
 		}
-
-		try {
-			const result = await analyzeMediaToolResult(absolutePath, {
-				...flags,
-				backend: options.backend,
-			});
-			const text = result.content
-				.filter((block): block is ToolTextBlock => block.type === "text")
-				.map((block) => block.text)
-				.join("\n\n");
-			sections.push(`Path: ${path}\n${text}`);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			sections.push(`Path: ${path}\n[Media analysis failed]\n\n${message}`);
-		}
+		references.push({ path, absolutePath, flags });
 	}
 
-	if (sections.length === 0) {
+	if (references.length === 0) {
 		return "";
 	}
+
+	const sections = new Array<string>(references.length);
+	let nextIndex = 0;
+	const workerCount = Math.min(EXPLICIT_MEDIA_ANALYSIS_CONCURRENCY, references.length);
+
+	await Promise.all(
+		Array.from({ length: workerCount }, async () => {
+			while (nextIndex < references.length) {
+				const index = nextIndex;
+				nextIndex += 1;
+				const reference = references[index];
+
+				try {
+					const result = await analyzeMediaToolResult(reference.absolutePath, {
+						...reference.flags,
+						backend: options.backend,
+					});
+					const text = result.content
+						.filter((block): block is ToolTextBlock => block.type === "text")
+						.map((block) => block.text)
+						.join("\n\n");
+					sections[index] = `Path: ${reference.path}\n${text}`;
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					sections[index] = `Path: ${reference.path}\n[Media analysis failed]\n\n${message}`;
+				}
+			}
+		}),
+	);
 
 	return [
 		"The following explicit @media references were analyzed before the agent response. Use these results as the contents of the referenced files.",
