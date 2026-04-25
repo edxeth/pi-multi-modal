@@ -8,7 +8,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomInt } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -1036,6 +1036,92 @@ function readClipboardText(): string | null {
 	return null;
 }
 
+const SMART_PASTE_DISPATCH_SEQUENCE = "\u001b[24~";
+
+function baseMimeTypeForSmartPaste(mimeType: string): string {
+	return mimeType.split(";")[0]?.trim().toLowerCase() ?? mimeType.toLowerCase();
+}
+
+function selectClipboardImageMimeType(typesText: string): string | null {
+	const types = typesText
+		.split(/\r?\n/)
+		.map((type) => type.trim())
+		.filter(Boolean);
+	const preferred = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+	for (const mimeType of preferred) {
+		const match = types.find((type) => baseMimeTypeForSmartPaste(type) === mimeType);
+		if (match) return match;
+	}
+	return types.find((type) => baseMimeTypeForSmartPaste(type).startsWith("image/")) ?? null;
+}
+
+function readClipboardImageSync(): { bytes: Buffer; mimeType: string } | null {
+	if (process.env.WAYLAND_DISPLAY) {
+		const list = spawnSync("wl-paste", ["--list-types"], { timeout: 1000, maxBuffer: 64 * 1024 });
+		if (!list.error && list.status === 0) {
+			const mimeType = selectClipboardImageMimeType(list.stdout?.toString("utf-8") ?? "");
+			if (mimeType) {
+				const data = spawnSync("wl-paste", ["--type", mimeType, "--no-newline"], {
+					timeout: 3000,
+					maxBuffer: 50 * 1024 * 1024,
+				});
+				if (!data.error && data.status === 0 && Buffer.isBuffer(data.stdout) && data.stdout.length > 0) {
+					return { bytes: data.stdout, mimeType: baseMimeTypeForSmartPaste(mimeType) };
+				}
+			}
+		}
+	}
+
+	if (process.env.DISPLAY) {
+		const targets = spawnSync("xclip", ["-selection", "clipboard", "-t", "TARGETS", "-o"], {
+			timeout: 1000,
+			maxBuffer: 64 * 1024,
+		});
+		if (!targets.error && targets.status === 0) {
+			const mimeType = selectClipboardImageMimeType(targets.stdout?.toString("utf-8") ?? "");
+			if (mimeType) {
+				const data = spawnSync("xclip", ["-selection", "clipboard", "-t", mimeType, "-o"], {
+					timeout: 3000,
+					maxBuffer: 50 * 1024 * 1024,
+				});
+				if (!data.error && data.status === 0 && Buffer.isBuffer(data.stdout) && data.stdout.length > 0) {
+					return { bytes: data.stdout, mimeType: baseMimeTypeForSmartPaste(mimeType) };
+				}
+			}
+		}
+	}
+
+	return null;
+}
+
+function readClipboardSmartPasteText(): string | null {
+	const image = readClipboardImageSync();
+	if (image) {
+		const ext = extensionForImageMimeType(image.mimeType) ?? "png";
+		const filePath = join(tmpdir(), `clipboard-${createClipboardImageId()}.${ext}`);
+		writeFileSync(filePath, image.bytes);
+		return `@${filePath}`;
+	}
+	return readClipboardText();
+}
+
+function bracketedPaste(text: string): string {
+	return `\u001b[200~${text}\u001b[201~`;
+}
+
+function handleSmartPasteTerminalInput(data: string): { consume?: boolean; data?: string } | undefined {
+	if (!data.includes(SMART_PASTE_DISPATCH_SEQUENCE)) {
+		return undefined;
+	}
+
+	const text = readClipboardSmartPasteText();
+	if (!text) {
+		return { consume: true };
+	}
+
+	return { data: data.split(SMART_PASTE_DISPATCH_SEQUENCE).join(bracketedPaste(text)) };
+}
+
 async function pasteClipboardIntoEditor(
 	ctx: Parameters<NonNullable<ExtensionAPI["registerShortcut"]>>[1]["handler"] extends (ctx: infer T) => unknown
 		? T
@@ -1173,6 +1259,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 	});
 	let explicitMediaAnalysisPaths = new Set<string>();
+	let smartPasteTerminalInputUnsubscribe: (() => void) | undefined;
 	const attachmentIndicatorController = createAttachmentIndicatorController();
 
 	const handleSmartPaste = async (
@@ -1206,6 +1293,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.hasUI) {
+			smartPasteTerminalInputUnsubscribe?.();
+			smartPasteTerminalInputUnsubscribe = ctx.ui.onTerminalInput(handleSmartPasteTerminalInput);
 			setWeztermUserVar("PI_SMART_PASTE", "1");
 			attachmentIndicatorController.attach(ctx as AttachmentIndicatorCtx);
 		}
@@ -1213,6 +1302,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (ctx.hasUI) {
+			smartPasteTerminalInputUnsubscribe?.();
+			smartPasteTerminalInputUnsubscribe = undefined;
 			setWeztermUserVar("PI_SMART_PASTE", "0");
 			attachmentIndicatorController.clear(ctx as AttachmentIndicatorCtx);
 		}
