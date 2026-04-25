@@ -103,12 +103,12 @@ verify_image_case() {
 
   local inserted image_path
   inserted=$(tr -d '\r\n' < "$IMAGE_RESULT")
-  if [[ ! "$inserted" =~ ^@/ ]]; then
+  if [[ ! "$inserted" =~ ^/tmp/clipboard-[[:alnum:]]+\.png$ ]]; then
     echo "Unexpected image result: $inserted" >&2
     return 1
   fi
 
-  image_path=${inserted#@}
+  image_path=$inserted
   if [[ ! -f "$image_path" ]]; then
     echo "Inserted image path is missing: $image_path" >&2
     return 1

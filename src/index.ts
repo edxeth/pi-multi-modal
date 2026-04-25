@@ -7,7 +7,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomInt } from "node:crypto";
 import { existsSync } from "node:fs";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -38,6 +38,16 @@ import {
 	sanitizeImagePromptForProvider,
 	supportsNativeImageInput,
 } from "./utils.js";
+
+const CLIPBOARD_IMAGE_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+function createClipboardImageId(length = 8): string {
+	let id = "";
+	for (let index = 0; index < length; index += 1) {
+		id += CLIPBOARD_IMAGE_ID_ALPHABET[randomInt(CLIPBOARD_IMAGE_ID_ALPHABET.length)];
+	}
+	return id;
+}
 
 // Embedded analysis prompt for the configured media backend
 const IMAGE_ANALYSIS_PROMPT = `You are analyzing an image. Follow these steps:
@@ -1047,7 +1057,7 @@ async function pasteClipboardIntoEditor(
 		const image = await readClipboardImage();
 		if (image) {
 			const ext = extensionForImageMimeType(image.mimeType) ?? "png";
-			const filePath = join(tmpdir(), `pi-clipboard-${randomUUID()}.${ext}`);
+			const filePath = join(tmpdir(), `clipboard-${createClipboardImageId()}.${ext}`);
 			await writeFile(filePath, image.bytes);
 			paste(`@${filePath}`);
 			return true;
@@ -1064,7 +1074,7 @@ async function pasteClipboardIntoEditor(
 		const image = await readClipboardImage();
 		if (image) {
 			const ext = extensionForImageMimeType(image.mimeType) ?? "png";
-			const filePath = join(tmpdir(), `pi-clipboard-${randomUUID()}.${ext}`);
+			const filePath = join(tmpdir(), `clipboard-${createClipboardImageId()}.${ext}`);
 			await writeFile(filePath, image.bytes);
 			paste(`@${filePath}`);
 			return true;

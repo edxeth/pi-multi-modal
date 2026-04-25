@@ -153,7 +153,7 @@ text = Path(sys.argv[1]).read_text(errors='replace')
 text = re.sub(r'\x1b\][^\x07]*(\x07|\x1b\\)', '', text)
 text = re.sub(r'\x1b\[[0-9;?]*[ -/]*[@-~]', '', text)
 text = re.sub(r'\x1b[@-_]', '', text)
-match = re.search(r'@(/tmp/pi-clipboard-[^\s]+)', text)
+match = re.search(r'@(/tmp/clipboard-[^\s]+)', text)
 if not match:
     raise SystemExit(1)
 print(match.group(1))
