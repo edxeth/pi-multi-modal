@@ -564,6 +564,13 @@ function createVisionAnalysisResult(label: string, summaryText: string, backend:
 	};
 }
 
+function mediaFlagsForPath(absolutePath: string): { image: boolean; video: boolean; pdf: boolean } | undefined {
+	const image = isImageFile(absolutePath);
+	const video = isVideoFile(absolutePath);
+	const pdf = isPdfFile(absolutePath);
+	return image || video || pdf ? { image, video, pdf } : undefined;
+}
+
 async function analyzeMediaToolResult(
 	absolutePath: string,
 	options: {
@@ -649,6 +656,9 @@ async function analyzeWithPi({ attachmentPaths, prompt, backend, signal }: Analy
 			"--print",
 			"--mode",
 			"json",
+			"--no-session",
+			"--no-skills",
+			"--no-context-files",
 			"--no-extensions",
 			"-p",
 			prompt,
@@ -1170,6 +1180,54 @@ async function pasteClipboardIntoEditor(
 	return false;
 }
 
+async function analyzeExplicitMediaReferences(
+	paths: string[],
+	options: {
+		cwd: string;
+		backend: MultiModalBackendConfig;
+	},
+): Promise<string> {
+	const sections: string[] = [];
+	const seen = new Set<string>();
+
+	for (const path of paths) {
+		const absolutePath = resolveUserPath(options.cwd, path);
+		if (seen.has(absolutePath)) {
+			continue;
+		}
+		seen.add(absolutePath);
+
+		const flags = mediaFlagsForPath(absolutePath);
+		if (!flags) {
+			continue;
+		}
+
+		try {
+			const result = await analyzeMediaToolResult(absolutePath, {
+				...flags,
+				backend: options.backend,
+			});
+			const text = result.content
+				.filter((block): block is ToolTextBlock => block.type === "text")
+				.map((block) => block.text)
+				.join("\n\n");
+			sections.push(`Path: ${path}\n${text}`);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			sections.push(`Path: ${path}\n[Media analysis failed]\n\n${message}`);
+		}
+	}
+
+	if (sections.length === 0) {
+		return "";
+	}
+
+	return [
+		"The following explicit @media references were analyzed before the agent response. Use these results as the contents of the referenced files.",
+		...sections,
+	].join("\n\n");
+}
+
 async function resolveInlineBashImageContent(
 	path: string,
 	options: {
@@ -1404,14 +1462,20 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	let explicitMediaPathsForContext: string[] = [];
+	let explicitMediaAnalysisForContext: string | undefined;
+
 	pi.on("turn_end", () => {
 		explicitMediaAnalysisPaths = new Set<string>();
+		explicitMediaPathsForContext = [];
+		explicitMediaAnalysisForContext = undefined;
 	});
 
 	pi.on("input", async (event, ctx) => {
-		explicitMediaAnalysisPaths = new Set(
-			findExplicitMediaPaths(event.text).map((path) => resolveUserPath(ctx.cwd, path)),
-		);
+		const explicitMediaPaths = findExplicitMediaPaths(event.text);
+		explicitMediaPathsForContext = explicitMediaPaths;
+		explicitMediaAnalysisForContext = undefined;
+		explicitMediaAnalysisPaths = new Set(explicitMediaPaths.map((path) => resolveUserPath(ctx.cwd, path)));
 		if (ctx.hasUI) {
 			attachmentIndicatorController.reset(ctx as AttachmentIndicatorCtx);
 		}
@@ -1473,13 +1537,57 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("context", (event, ctx) => {
+	pi.on("context", async (event, ctx) => {
 		const messages = structuredClone(event.messages).filter(
 			(message) => message.role !== "custom" || message.customType !== REFERENCED_IMAGES_MESSAGE_TYPE,
 		);
 		let changed = messages.length !== event.messages.length;
+		const supportsImages = supportsNativeImageInput(ctx.model?.input);
+		const mediaPathsToAnalyze = supportsImages
+			? explicitMediaPathsForContext.filter((path) => {
+					const absolutePath = resolveUserPath(ctx.cwd, path);
+					return isVideoFile(absolutePath) || isPdfFile(absolutePath);
+				})
+			: explicitMediaPathsForContext;
 
-		if (!supportsNativeImageInput(ctx.model?.input)) {
+		if (mediaPathsToAnalyze.length > 0) {
+			if (!explicitMediaAnalysisForContext) {
+				if (ctx.hasUI) {
+					ctx.ui.notify(`Analyzing ${mediaPathsToAnalyze.length} explicit @media reference(s)...`, "info");
+				}
+				const backend = await getMultiModalBackend();
+				explicitMediaAnalysisForContext = await analyzeExplicitMediaReferences(mediaPathsToAnalyze, {
+					cwd: ctx.cwd,
+					backend,
+				});
+			}
+
+			if (explicitMediaAnalysisForContext) {
+				for (let index = messages.length - 1; index >= 0; index--) {
+					const message = messages[index];
+					if (message.role !== "user") {
+						continue;
+					}
+
+					if (typeof message.content === "string") {
+						message.content = `${message.content}\n\n${explicitMediaAnalysisForContext}`;
+						changed = true;
+						break;
+					}
+
+					const textBlock = message.content.find((block) => block.type === "text");
+					if (textBlock) {
+						textBlock.text = `${textBlock.text}\n\n${explicitMediaAnalysisForContext}`;
+					} else {
+						message.content = [{ type: "text", text: explicitMediaAnalysisForContext }, ...message.content];
+					}
+					changed = true;
+					break;
+				}
+			}
+		}
+
+		if (!supportsImages) {
 			return changed ? { messages } : undefined;
 		}
 

@@ -143,12 +143,18 @@ async function analyzeImageWithPi(imagePath: string, useStructuredPrompt = false
 			"--mode",
 			"json",
 			"--print",
+			"--no-session",
+			"--no-skills",
+			"--no-context-files",
 			"--no-extensions",
 		];
 
+		const childEnv = { ...process.env };
+		delete childEnv.PI_PACKAGE_DIR;
+
 		const child = spawn("pi", args, {
 			stdio: ["ignore", "pipe", "pipe"],
-			env: process.env,
+			env: childEnv,
 		});
 
 		let stdout = "";
