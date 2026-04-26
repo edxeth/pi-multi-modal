@@ -17,11 +17,7 @@
  * @param height - Image height in pixels
  * @returns Sixel escape sequence string (DCS q ... ST)
  */
-export function encodePixelsAsSixel(
-	pixels: Uint8Array,
-	width: number,
-	height: number,
-): string {
+export function encodePixelsAsSixel(pixels: Uint8Array, width: number, height: number): string {
 	const LEVELS = 6; // 6 levels per channel → 216 colors (web-safe palette)
 
 	// Quantize a channel value (0-255) to a level (0-5)

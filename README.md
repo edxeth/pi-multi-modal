@@ -110,12 +110,18 @@ This saves to `~/.pi/agent/settings.json` under:
   "multiModal": {
     "provider": "google",
     "model": "gemini-3-flash-preview",
-    "thinkingLevel": "high"
+    "thinkingLevel": "high",
+    "analysisSession": "isolated"
   }
 }
 ```
 
 If `:thinking` is omitted, pi-multi-modal does not pass `--thinking` to the backend subprocess.
+
+`analysisSession` controls how the backend subprocess gets conversation context:
+
+- `"isolated"` keeps the previous behavior: run media analysis in an ephemeral `--no-session` pi process.
+- `"fork"` forks the current pi session into a temporary session directory, runs media analysis there, then deletes the temporary fork. If the current session file is unavailable, it falls back to isolated mode.
 
 Requirements for the configured backend:
 - the model must exist in Pi's model registry

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	buildImageReferenceSuffix,
 	colorizeImagePlaceholders,
+	DEFAULT_ANALYSIS_SESSION_MODE,
 	DEFAULT_MULTI_MODAL_BACKEND,
 	extractErrorFromPiOutput,
 	extractTextFromPiOutput,
@@ -16,6 +17,7 @@ import {
 	needsVisionProxy,
 	parseBashImageOutput,
 	parseMultiModalBackend,
+	readAnalysisSessionModeSetting,
 	readMultiModalBackendSetting,
 	replaceExplicitInlineImagePathsWithPlaceholders,
 	replaceInlineImagePathsWithPlaceholders,
@@ -62,6 +64,12 @@ describe("multi-modal backend helpers", () => {
 				multiModal: { provider: "google", model: "gemini-3-flash-preview", thinkingLevel: "high" },
 			}),
 		).toEqual({ provider: "google", model: "gemini-3-flash-preview", thinkingLevel: "high" });
+	});
+
+	it("reads analysis session mode settings and falls back to isolated", () => {
+		expect(readAnalysisSessionModeSetting(undefined)).toBe(DEFAULT_ANALYSIS_SESSION_MODE);
+		expect(readAnalysisSessionModeSetting({ multiModal: { analysisSession: "fork" } })).toBe("fork");
+		expect(readAnalysisSessionModeSetting({ multiModal: { analysisSession: "temporary" } })).toBe("isolated");
 	});
 });
 
@@ -448,4 +456,3 @@ describe("extractTextFromPiOutput", () => {
 		expect(extractTextFromPiOutput("")).toBe("");
 	});
 });
-

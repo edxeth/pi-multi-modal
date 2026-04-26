@@ -18,6 +18,8 @@ import { BorderedLoader, createBashTool, createReadTool, getAgentDir } from "@ma
 import { type Component, Container, Image, Spacer, Text } from "@mariozechner/pi-tui";
 import { extensionForImageMimeType, readClipboardImage } from "./clipboard-image.js";
 import {
+	type AnalysisSessionMode,
+	DEFAULT_ANALYSIS_SESSION_MODE,
 	DEFAULT_MULTI_MODAL_BACKEND,
 	extractErrorFromPiOutput,
 	extractTextFromPiOutput,
@@ -32,6 +34,7 @@ import {
 	PI_BASH_IMAGE_MARKER_PREFIX,
 	parseBashImageOutput,
 	parseMultiModalBackend,
+	readAnalysisSessionModeSetting,
 	readMultiModalBackendSetting,
 	replaceExplicitInlineImagePathsWithPlaceholders,
 	resolveShowImagesSetting,
@@ -422,19 +425,43 @@ async function getMultiModalBackend(): Promise<MultiModalBackendConfig> {
 	return readMultiModalBackendSetting(await readJsonFileIfExists(GLOBAL_SETTINGS_PATH));
 }
 
+async function getAnalysisSessionMode(): Promise<AnalysisSessionMode> {
+	return readAnalysisSessionModeSetting(await readJsonFileIfExists(GLOBAL_SETTINGS_PATH));
+}
+
+async function getAnalysisSessionOptions(ctx: {
+	sessionManager?: { getSessionFile?: () => string | undefined };
+}): Promise<AnalysisSessionOptions> {
+	const mode = await getAnalysisSessionMode();
+	if (mode !== "fork") {
+		return { mode };
+	}
+	return { mode, sourceSessionFile: ctx.sessionManager?.getSessionFile?.() };
+}
+
+function writeBackendIntoSettings(settings: Record<string, unknown>, config: MultiModalBackendConfig): void {
+	const currentMultiModal = settings.multiModal;
+	const multiModal: Record<string, unknown> =
+		currentMultiModal && typeof currentMultiModal === "object" && !Array.isArray(currentMultiModal)
+			? { ...currentMultiModal }
+			: {};
+	multiModal.provider = config.provider;
+	multiModal.model = config.model;
+	if (config.thinkingLevel) {
+		multiModal.thinkingLevel = config.thinkingLevel;
+	} else {
+		delete multiModal.thinkingLevel;
+	}
+	if (multiModal.analysisSession !== "isolated" && multiModal.analysisSession !== "fork") {
+		multiModal.analysisSession = DEFAULT_ANALYSIS_SESSION_MODE;
+	}
+	settings.multiModal = multiModal;
+}
+
 async function saveMultiModalBackend(config: MultiModalBackendConfig): Promise<void> {
 	const current = await readJsonFileIfExists(GLOBAL_SETTINGS_PATH);
 	const settings = current && typeof current === "object" && !Array.isArray(current) ? { ...current } : {};
-	(settings as Record<string, unknown>).multiModal = config.thinkingLevel
-		? {
-				provider: config.provider,
-				model: config.model,
-				thinkingLevel: config.thinkingLevel,
-			}
-		: {
-				provider: config.provider,
-				model: config.model,
-			};
+	writeBackendIntoSettings(settings as Record<string, unknown>, config);
 	await writeJsonFile(GLOBAL_SETTINGS_PATH, settings);
 }
 
@@ -579,11 +606,12 @@ async function analyzeMediaToolResult(
 		video: boolean;
 		pdf: boolean;
 		backend: MultiModalBackendConfig;
+		session?: AnalysisSessionOptions;
 		signal?: AbortSignal;
 		onUpdate?: (result: ToolResult) => void;
 	},
 ): Promise<ToolResult> {
-	const { video, pdf, backend, signal, onUpdate } = options;
+	const { video, pdf, backend, session, signal, onUpdate } = options;
 	const mediaType = video ? "video" : pdf ? "PDF" : "image";
 	const backendLabel = formatMultiModalBackend(backend);
 	onUpdate?.({
@@ -602,10 +630,10 @@ async function analyzeMediaToolResult(
 
 	try {
 		const summaryText = video
-			? await analyzeVideo({ absolutePath, backend, signal })
+			? await analyzeVideo({ absolutePath, backend, session, signal })
 			: pdf
-				? await analyzePdf({ absolutePath, backend, signal })
-				: await analyzeImage({ absolutePath, backend, signal });
+				? await analyzePdf({ absolutePath, backend, session, signal })
+				: await analyzeImage({ absolutePath, backend, session, signal });
 
 		if (signal?.aborted) {
 			throw new Error("Operation aborted");
@@ -620,21 +648,29 @@ async function analyzeMediaToolResult(
 	}
 }
 
+interface AnalysisSessionOptions {
+	mode: AnalysisSessionMode;
+	sourceSessionFile?: string;
+}
+
 interface AnalyzeImageOptions {
 	absolutePath: string;
 	backend: MultiModalBackendConfig;
+	session?: AnalysisSessionOptions;
 	signal?: AbortSignal;
 }
 
 interface AnalyzeVideoOptions {
 	absolutePath: string;
 	backend: MultiModalBackendConfig;
+	session?: AnalysisSessionOptions;
 	signal?: AbortSignal;
 }
 
 interface AnalyzePdfOptions {
 	absolutePath: string;
 	backend: MultiModalBackendConfig;
+	session?: AnalysisSessionOptions;
 	signal?: AbortSignal;
 }
 
@@ -642,92 +678,119 @@ interface AnalyzeWithPiOptions {
 	attachmentPaths: string[];
 	prompt: string;
 	backend: MultiModalBackendConfig;
+	session?: AnalysisSessionOptions;
 	signal?: AbortSignal;
 }
 
-async function analyzeWithPi({ attachmentPaths, prompt, backend, signal }: AnalyzeWithPiOptions): Promise<string> {
-	return new Promise((resolvePromise, reject) => {
-		const args = [
-			...attachmentPaths.map((path) => `@${path}`),
-			"--provider",
-			backend.provider,
-			"--model",
-			backend.model,
-			...(backend.thinkingLevel ? ["--thinking", backend.thinkingLevel] : []),
-			"--print",
-			"--mode",
-			"json",
-			"--no-session",
-			"--no-skills",
-			"--no-context-files",
-			"--no-extensions",
-			"-p",
-			prompt,
-		];
+async function createAnalysisSessionArgs(
+	session: AnalysisSessionOptions | undefined,
+): Promise<{ args: string[]; cleanup: () => Promise<void> }> {
+	if (session?.mode === "fork" && session.sourceSessionFile && existsSync(session.sourceSessionFile)) {
+		const sessionDir = await mkdtemp(join(tmpdir(), "pi-multi-modal-session-"));
+		return {
+			args: ["--fork", session.sourceSessionFile, "--session-dir", sessionDir],
+			cleanup: () => rm(sessionDir, { recursive: true, force: true }),
+		};
+	}
 
-		const childEnv = { ...process.env };
-		delete childEnv.PI_PACKAGE_DIR;
-
-		const child = spawn("pi", args, {
-			stdio: ["ignore", "pipe", "pipe"],
-			env: childEnv,
-		});
-
-		let stdout = "";
-		let stderr = "";
-
-		child.stdout.on("data", (data: Buffer) => {
-			stdout += data.toString();
-		});
-
-		child.stderr.on("data", (data: Buffer) => {
-			stderr += data.toString();
-		});
-
-		child.on("error", (err: Error) => {
-			reject(err);
-		});
-
-		child.on("close", (code: number | null) => {
-			if (code !== 0) {
-				reject(new Error(`pi subprocess failed (${code}): ${stderr}`));
-				return;
-			}
-
-			const output = stdout.trim();
-			const error = extractErrorFromPiOutput(output);
-			if (error) {
-				reject(new Error(error));
-				return;
-			}
-
-			const text = extractTextFromPiOutput(output);
-			if (text === output && output.startsWith("{")) {
-				reject(new Error("pi subprocess returned no assistant text"));
-				return;
-			}
-
-			resolvePromise(text);
-		});
-
-		if (signal) {
-			const onAbort = () => {
-				child.kill();
-				reject(new Error("Operation aborted"));
-			};
-			signal.addEventListener("abort", onAbort, { once: true });
-			child.on("close", () => {
-				signal.removeEventListener("abort", onAbort);
-			});
-		}
-	});
+	return { args: ["--no-session"], cleanup: async () => undefined };
 }
 
-async function analyzeImage({ absolutePath, backend, signal }: AnalyzeImageOptions): Promise<string> {
+async function analyzeWithPi({
+	attachmentPaths,
+	prompt,
+	backend,
+	session,
+	signal,
+}: AnalyzeWithPiOptions): Promise<string> {
+	const analysisSession = await createAnalysisSessionArgs(session);
+	try {
+		return await new Promise((resolvePromise, reject) => {
+			const args = [
+				...attachmentPaths.map((path) => `@${path}`),
+				...analysisSession.args,
+				"--provider",
+				backend.provider,
+				"--model",
+				backend.model,
+				...(backend.thinkingLevel ? ["--thinking", backend.thinkingLevel] : []),
+				"--print",
+				"--mode",
+				"json",
+				"--no-skills",
+				"--no-context-files",
+				"--no-extensions",
+				"-p",
+				prompt,
+			];
+
+			const childEnv = { ...process.env };
+			delete childEnv.PI_PACKAGE_DIR;
+
+			const child = spawn("pi", args, {
+				stdio: ["ignore", "pipe", "pipe"],
+				env: childEnv,
+			});
+
+			let stdout = "";
+			let stderr = "";
+
+			child.stdout.on("data", (data: Buffer) => {
+				stdout += data.toString();
+			});
+
+			child.stderr.on("data", (data: Buffer) => {
+				stderr += data.toString();
+			});
+
+			child.on("error", (err: Error) => {
+				reject(err);
+			});
+
+			child.on("close", (code: number | null) => {
+				if (code !== 0) {
+					reject(new Error(`pi subprocess failed (${code}): ${stderr}`));
+					return;
+				}
+
+				const output = stdout.trim();
+				const error = extractErrorFromPiOutput(output);
+				if (error) {
+					reject(new Error(error));
+					return;
+				}
+
+				const text = extractTextFromPiOutput(output);
+				if (text === output && output.startsWith("{")) {
+					reject(new Error("pi subprocess returned no assistant text"));
+					return;
+				}
+
+				resolvePromise(text);
+			});
+
+			if (signal) {
+				const onAbort = () => {
+					child.kill();
+					reject(new Error("Operation aborted"));
+				};
+				signal.addEventListener("abort", onAbort, { once: true });
+				child.on("close", () => {
+					signal.removeEventListener("abort", onAbort);
+				});
+			}
+		});
+	} finally {
+		await analysisSession.cleanup();
+	}
+}
+
+async function analyzeImage({ absolutePath, backend, session, signal }: AnalyzeImageOptions): Promise<string> {
 	return analyzeWithPi({
 		attachmentPaths: [absolutePath],
 		prompt: IMAGE_ANALYSIS_PROMPT,
 		backend,
+		session,
 		signal,
 	});
 }
@@ -782,7 +845,7 @@ async function extractPdfPages(absolutePath: string, pagesDir: string, signal?: 
 		.map((name) => join(pagesDir, name));
 }
 
-async function analyzePdf({ absolutePath, backend, signal }: AnalyzePdfOptions): Promise<string> {
+async function analyzePdf({ absolutePath, backend, session, signal }: AnalyzePdfOptions): Promise<string> {
 	const pagesDir = await mkdtemp(join(process.cwd(), ".pi-multi-modal-pdf-"));
 	let succeeded = false;
 
@@ -796,6 +859,7 @@ async function analyzePdf({ absolutePath, backend, signal }: AnalyzePdfOptions):
 			attachmentPaths: pages,
 			prompt: `${PDF_ANALYSIS_PROMPT}\n\nThe attached images are rendered pages from a PDF in order.`,
 			backend,
+			session,
 			signal,
 		});
 		succeeded = true;
@@ -915,7 +979,7 @@ async function extractVideoFrames(absolutePath: string, framesDir: string, signa
 		.map((name) => join(framesDir, name));
 }
 
-async function analyzeVideo({ absolutePath, backend, signal }: AnalyzeVideoOptions): Promise<string> {
+async function analyzeVideo({ absolutePath, backend, session, signal }: AnalyzeVideoOptions): Promise<string> {
 	const framesDir = await mkdtemp(join(process.cwd(), ".pi-multi-modal-frames-"));
 	let succeeded = false;
 
@@ -929,6 +993,7 @@ async function analyzeVideo({ absolutePath, backend, signal }: AnalyzeVideoOptio
 			attachmentPaths: frames,
 			prompt: VIDEO_ANALYSIS_PROMPT,
 			backend,
+			session,
 			signal,
 		});
 		succeeded = true;
@@ -1186,6 +1251,7 @@ async function analyzeExplicitMediaReferences(
 	options: {
 		cwd: string;
 		backend: MultiModalBackendConfig;
+		session?: AnalysisSessionOptions;
 	},
 ): Promise<string> {
 	const references: Array<{
@@ -1228,6 +1294,7 @@ async function analyzeExplicitMediaReferences(
 					const result = await analyzeMediaToolResult(reference.absolutePath, {
 						...reference.flags,
 						backend: options.backend,
+						session: options.session,
 					});
 					const text = result.content
 						.filter((block): block is ToolTextBlock => block.type === "text")
@@ -1269,6 +1336,7 @@ async function resolveInlineBashImageContent(
 			video: false,
 			pdf: false,
 			backend,
+			session: await getAnalysisSessionOptions(ctx),
 			signal,
 		});
 		return result.content;
@@ -1437,6 +1505,7 @@ export default function (pi: ExtensionAPI) {
 						video,
 						pdf,
 						backend,
+						session: await getAnalysisSessionOptions(ctx),
 					});
 					return { content: result.content, details: result.details };
 				}
@@ -1579,6 +1648,7 @@ export default function (pi: ExtensionAPI) {
 				explicitMediaAnalysisForContext = await analyzeExplicitMediaReferences(mediaPathsToAnalyze, {
 					cwd: ctx.cwd,
 					backend,
+					session: await getAnalysisSessionOptions(ctx),
 				});
 			}
 
@@ -1689,6 +1759,7 @@ export default function (pi: ExtensionAPI) {
 					video,
 					pdf,
 					backend,
+					session: await getAnalysisSessionOptions(ctx),
 					signal,
 					onUpdate,
 				});
@@ -1746,7 +1817,8 @@ export default function (pi: ExtensionAPI) {
 				const loader = new BorderedLoader(tui, theme, `Analyzing ${imagePath}...`);
 				loader.onAbort = () => done(null);
 
-				analyzeImage({ absolutePath, backend, signal: loader.signal })
+				void getAnalysisSessionOptions(ctx)
+					.then((session) => analyzeImage({ absolutePath, backend, session, signal: loader.signal }))
 					.then((text) => done(text))
 					.catch((err) => {
 						ctx.ui.notify(`Analysis failed: ${err.message}`, "error");
@@ -1791,7 +1863,8 @@ export default function (pi: ExtensionAPI) {
 				const loader = new BorderedLoader(tui, theme, `Analyzing ${videoPath}...`);
 				loader.onAbort = () => done(null);
 
-				analyzeVideo({ absolutePath, backend, signal: loader.signal })
+				void getAnalysisSessionOptions(ctx)
+					.then((session) => analyzeVideo({ absolutePath, backend, session, signal: loader.signal }))
 					.then((text) => done(text))
 					.catch((err) => {
 						ctx.ui.notify(`Analysis failed: ${err.message}`, "error");

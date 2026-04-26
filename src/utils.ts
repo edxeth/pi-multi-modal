@@ -11,6 +11,9 @@ export interface MultiModalBackendConfig {
 	model: string;
 	thinkingLevel?: ThinkingLevel;
 }
+export const ANALYSIS_SESSION_MODES = ["isolated", "fork"] as const;
+export type AnalysisSessionMode = (typeof ANALYSIS_SESSION_MODES)[number];
+export const DEFAULT_ANALYSIS_SESSION_MODE: AnalysisSessionMode = "isolated";
 export const DEFAULT_MULTI_MODAL_BACKEND: MultiModalBackendConfig = {
 	provider: DEFAULT_MULTI_MODAL_PROVIDER,
 	model: DEFAULT_MULTI_MODAL_MODEL,
@@ -67,6 +70,10 @@ export function isThinkingLevel(value: string | undefined): value is ThinkingLev
 	return value !== undefined && THINKING_LEVELS.includes(value as ThinkingLevel);
 }
 
+export function isAnalysisSessionMode(value: string | undefined): value is AnalysisSessionMode {
+	return value !== undefined && ANALYSIS_SESSION_MODES.includes(value as AnalysisSessionMode);
+}
+
 export function parseMultiModalBackend(input: string): MultiModalBackendConfig | null {
 	const trimmed = input.trim();
 	const slashIndex = trimmed.indexOf("/");
@@ -117,6 +124,11 @@ export function readMultiModalBackendSetting(settings: unknown): MultiModalBacke
 	const model = readStringSetting(settings, ["multiModal", "model"]) ?? DEFAULT_MULTI_MODAL_BACKEND.model;
 	const thinkingLevel = readStringSetting(settings, ["multiModal", "thinkingLevel"]);
 	return isThinkingLevel(thinkingLevel) ? { provider, model, thinkingLevel } : { provider, model };
+}
+
+export function readAnalysisSessionModeSetting(settings: unknown): AnalysisSessionMode {
+	const mode = readStringSetting(settings, ["multiModal", "analysisSession"]);
+	return isAnalysisSessionMode(mode) ? mode : DEFAULT_ANALYSIS_SESSION_MODE;
 }
 
 export function parseBashImageOutput(text: string): { parts: BashImageOutputPart[]; foundMarkers: boolean } {
