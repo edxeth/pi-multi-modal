@@ -1,6 +1,6 @@
 {
 	"name": "pi-multi-modal",
-	"version": "0.1.4",
+	"version": "1.0.0",
 	"type": "module",
 	"description": "Pi extension that proxies local media analysis through a configurable backend for models without native image support",
 	"keywords": [
