@@ -1,144 +1,164 @@
 # pi-multi-modal
 
-A [pi](https://github.com/badlogic/pi-mono) extension for local image, video, and PDF paths.
+`pi-multi-modal` lets pi work with local images, videos, and PDFs without making you change how you talk to the agent.
 
-It does three jobs depending on the active model and workflow:
+Point at a file with `@./path`, or emit an image from bash with `__PI_IMAGE__`. If the active model can see images, pi gets the image directly. If it cannot, this extension quietly asks a configured vision model to analyze the media and gives the active agent a clean text summary.
 
-- **Models with native image input**: explicit `@./image.png` paths are attached as real image inputs.
-- **Models without native image input**: explicit `@./image.png`, `@./video.mp4`, or `@./file.pdf` paths opt into media analysis when the agent reads that same file.
-- **Bash image workflows**: the bash tool gets a built-in `__PI_IMAGE__` helper so any command that creates a local image file can return it inline in the same tool result.
+## The short version
 
-## Behavior
+```text
+Compare @./before.png and @./after.png
+Analyze @./screenshot.png and explain the error
+Summarize @./demo.mp4
+Review @./report.pdf
+```
 
-### 1) Native image-input models
+For generated images:
 
-For models that already support images, the extension keeps the normal explicit-attachment workflow:
+```bash
+python make-chart.py && __PI_IMAGE__ chart.png
+```
+
+That is the whole idea: local media should feel like normal pi context.
+
+## How it behaves
+
+### Image-capable models
+
+When the current model supports image input, explicit image references are attached as real image blocks:
 
 ```text
 Compare @./before.png and @./after.png
 ```
 
-What happens:
-- the image files are attached to the current conversation
-- the visible path text is rewritten to placeholders like `[Image #1]`
-- the active model handles the image directly
+The extension attaches the image data for the model. In the UI you are more likely to see an attachment indicator or preview, while the prompt text stays readable. This direct attachment path is for images only.
 
-This path is for **images only**.
+### Text-only models
 
-### 2) Non-vision models
-
-For text-only models, `@path` becomes an explicit opt-in for media analysis.
+When the current model cannot see images, `@path` becomes an intentional request to make that media analyzable.
 
 ```text
 Analyze @./screenshot.png
-Summarize @./demo.mp4
-Review @./report.pdf
 ```
 
-What happens:
-- the `@path` marks that file as intentionally analyzable media
-- if the agent later uses the `read` tool on that same path, the extension intercepts it
-- the file is analyzed with the configured pi-multi-modal backend
-- the agent receives a structured summary instead of raw file contents
+If the agent later reads that same path, `pi-multi-modal` intercepts the read, sends the media to the configured vision backend, and returns a structured summary instead of raw bytes.
 
-Plain paths without `@` are left alone.
+Plain paths are left alone. The extension only analyzes media that was explicitly referenced with `@`.
 
-### 3) Inline bash images
+### Bash-produced images
 
-The extension injects a `__PI_IMAGE__` shell helper into the bash tool.
+The extension adds a small shell helper named `__PI_IMAGE__` to bash tool calls:
 
 ```bash
-python make-chart.py && __PI_IMAGE__ chart.png
-my-tool-that-generates-an-image && __PI_IMAGE__ output.png
+agent-browser open https://example.com \
+  && agent-browser wait --load networkidle \
+  && agent-browser screenshot page.png \
+  && __PI_IMAGE__ page.png
 ```
 
-What happens:
-- the helper emits markers for real local image paths
-- pi-multi-modal replaces those markers before the model sees the tool result
-- vision models receive the actual image block inline
-- non-vision models receive an inline analysis from the configured backend instead
-
-## TIA compatibility
-
-If you run pi through TIA and keep TIA's `fast-tools.ts` enabled, set:
-
-```bash
-export PI_MULTI_MODAL_WRAP_EXISTING_TOOLS=1
-```
-
-In this mode, pi-multi-modal does **not** register public `read` or `bash` tools. TIA keeps ownership of those fast tools, and pi-multi-modal wraps them through pi's tool events:
-
-- normal text `read` stays on TIA's fast `read`
-- normal/safe `bash` stays on TIA's fast `bash`
-- image/video/PDF `read` results are replaced with pi-multi-modal media-aware results when applicable
-- `bash` commands using `__PI_IMAGE__` get the helper preamble and marker processing
-
-This avoids duplicate `read`/`bash` tool conflicts while preserving media handling.
-
-Example shell setup:
-
-```bash
-export PI_MULTI_MODAL_WRAP_EXISTING_TOOLS=1
-alias pi='tia pi'
-alias p='tia pi'
-```
-
-Notes:
-- explicit media analysis still uses `@path` opt-in semantics for non-vision models
-- video analysis requires explicit media references such as `@./demo.mp4`
-- the internal media-analysis subprocess clears inherited `PI_PACKAGE_DIR` so it can run normal pi correctly under TIA
+For image-capable models, the result includes the image itself. For text-only models, the result includes a vision-backend summary.
 
 ## Backend configuration
 
-Default backend:
+The built-in default is:
 
 ```text
 zai/glm-4.6v
 ```
 
-Set a different backend in interactive mode:
+Set another backend from inside pi:
 
 ```text
-/multi-modal zai/glm-4.6v
+/multi-modal nahcrof/kimi-k2.5-lightning
+/multi-modal nahcrof/kimi-k2.6-precision:high
 /multi-modal google/gemini-3-flash-preview:high
 ```
 
-This saves to `~/.pi/agent/settings.json` under:
+The command writes this shape to `~/.pi/agent/settings.json`:
 
 ```json
 {
   "multiModal": {
-    "provider": "google",
-    "model": "gemini-3-flash-preview",
+    "provider": "nahcrof",
+    "model": "kimi-k2.6-precision",
     "thinkingLevel": "high",
     "analysisSession": "isolated"
   }
 }
 ```
 
-If `:thinking` is omitted, pi-multi-modal does not pass `--thinking` to the backend subprocess.
+If you leave off `:thinking`, no thinking flag is passed to the backend.
 
-`analysisSession` controls how the backend subprocess gets conversation context:
+The backend model must exist in your pi model registry and must support image input.
 
-- `"isolated"` keeps the previous behavior: run media analysis in an ephemeral `--no-session` pi process.
-- `"fork"` forks the current pi session into a temporary session directory, runs media analysis there, then deletes the temporary fork. If the current session file is unavailable, it falls back to isolated mode.
+## Conversation awareness
 
-Requirements for the configured backend:
-- the model must exist in Pi's model registry
-- the model must support image input
+Media analysis runs in a short-lived backend pi process. `analysisSession` controls how much conversation that backend can see:
 
-## Features
+- `"isolated"` starts the analyzer with no prior conversation. This is the default. It is best when you want the media summary to stand on its own.
+- `"fork"` gives the analyzer a temporary fork of the current pi session. This is useful when the image only makes sense with earlier chat context, for example “compare this to the previous screenshot.”
 
-- explicit `@path` handling for native image-input models
-- explicit opt-in media analysis for non-vision models
-- configurable backend via `/multi-modal`
-- inline bash image ingestion via `__PI_IMAGE__`
-- image classification for screenshots, diagrams, charts, and general images
-- video analysis via local keyframe extraction with `ffmpeg`
-- PDF analysis via rendered page images
-- manual commands:
-  - `/analyze-image <path>`
-  - `/analyze-video <path>`
+Both modes are ephemeral. Isolated analysis uses `--no-session`. Forked analysis writes into a temporary session directory and deletes it after the analysis finishes. If pi cannot find the current session file, fork mode safely falls back to isolated mode.
+
+The analyzer is also told which mode it is in, so it knows whether it can rely on previous conversation or must only use the media and the analysis prompt.
+
+## Compatibility with custom tool providers
+
+By default, `pi-multi-modal` registers its own `read` and `bash` tools so it can intercept media reads and inject the `__PI_IMAGE__` helper.
+
+That is perfect for normal pi. It can be wrong if your setup already provides replacement `read` or `bash` tools — for example a local wrapper, company launcher, performance extension, or another pi extension that reserves the same tool names. In that case two extensions may try to own `read` or `bash`, and pi-multi-modal should wrap the existing tools instead of registering competing ones.
+
+Set this before launching pi:
+
+```bash
+export PI_MULTI_MODAL_WRAP_EXISTING_TOOLS=1
+```
+
+In wrap mode, `pi-multi-modal` does **not** register public `read` or `bash` tools. Instead, it listens around whatever tools already exist and only changes the media-specific parts:
+
+- ordinary text reads stay with your existing `read` tool
+- ordinary bash commands stay with your existing `bash` tool
+- explicit media reads can become vision summaries
+- bash commands using `__PI_IMAGE__` can return inline images or summaries
+
+Use this mode only when another package already owns `read` or `bash`. If you are unsure, leave it unset.
+
+Example wrapper setup:
+
+```bash
+export PI_MULTI_MODAL_WRAP_EXISTING_TOOLS=1
+alias pi='my-pi-wrapper pi'
+```
+
+The internal analyzer also clears inherited package-launcher state before it starts the backend pi process, so the media analysis subprocess does not accidentally recurse through the same wrapper environment.
+
+## Supported formats
+
+Native image attachment:
+
+- `.jpg`, `.jpeg`
+- `.png`
+- `.gif`
+- `.webp`
+
+Vision-backend analysis:
+
+- images: `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`
+- videos: `.mp4`, `.mkv`, `.mov`
+- PDFs: `.pdf`
+
+Video analysis needs `ffmpeg` and `ffprobe` in `PATH`.
+PDF analysis needs Ghostscript's `gs` in `PATH`.
+
+## Commands
+
+```text
+/multi-modal <provider/model[:thinking]>
+/analyze-image <path>
+/analyze-video <path>
+```
+
+`/multi-modal` changes the backend used for media summaries. The analyze commands are manual shortcuts when you want to inspect media directly.
 
 ## Installation
 
@@ -160,47 +180,6 @@ Try it without installing:
 pi -e git:github.com/edxeth/pi-multi-modal
 ```
 
-## Usage
-
-Example with a vision-capable model:
-
-```text
-Compare @./before.png and @./after.png
-```
-
-Example with a non-vision model:
-
-```text
-Analyze @./screenshot.png and explain the error
-```
-
-If the agent reads `./screenshot.png`, the extension routes that read through the configured backend.
-
-`agent-browser` example in one bash result:
-
-```bash
-agent-browser open https://example.com \
-  && agent-browser wait --load networkidle \
-  && agent-browser screenshot page.png \
-  && __PI_IMAGE__ page.png
-```
-
-## Supported formats
-
-### Native attachment path
-- JPEG (`.jpg`, `.jpeg`)
-- PNG (`.png`)
-- GIF (`.gif`)
-- WebP (`.webp`)
-
-### Media analysis path
-- Images: `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`
-- Videos: `.mp4`, `.mkv`, `.mov`
-- PDFs: `.pdf`
-
-Video analysis requires `ffmpeg` and `ffprobe` in `PATH`.
-PDF analysis requires `gs` (Ghostscript) in `PATH`.
-
 ## Development
 
 ```bash
@@ -209,15 +188,37 @@ npm test
 npx tsc --noEmit
 ```
 
-Integration tests call a real vision backend and require an explicit test target:
+Full local check:
 
 ```bash
-PI_MULTI_MODAL_TEST_BACKEND=zai-messages/glm-5v-turbo npm run test:integration
+npm run check
 ```
 
-Use any Pi-registered vision-capable model in `<provider/model[:thinking]>` form. Do not rely on personal `~/.pi/agent/settings.json` for integration tests.
+Integration tests call a real vision backend. Pick an explicit pi-registered image model:
 
-See [test-fixtures/README.md](./test-fixtures/README.md) for fixture details and benchmarks.
+```bash
+PI_MULTI_MODAL_TEST_BACKEND=nahcrof/kimi-k2.5-lightning npm run test:integration
+```
+
+Do not rely on personal `~/.pi/agent/settings.json` for integration tests.
+
+To benchmark whether `analysisSession` is behaving correctly across live pi runs:
+
+```bash
+npm run benchmark:analysis-session
+```
+
+The benchmark checks the important contract: isolated analyzers should not see a prior conversation tag; forked analyzers should.
+
+Use a narrower model set when you want a cheaper run:
+
+```bash
+PI_MULTI_MODAL_BENCH_MODELS=nahcrof/kimi-k2.5-lightning \
+PI_MULTI_MODAL_BENCH_REPEATS=1 \
+npm run benchmark:analysis-session
+```
+
+See [test-fixtures/README.md](./test-fixtures/README.md) for fixture details.
 
 ## License
 

@@ -1,14 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
-	buildImageReferenceSuffix,
-	colorizeImagePlaceholders,
 	DEFAULT_ANALYSIS_SESSION_MODE,
 	DEFAULT_MULTI_MODAL_BACKEND,
 	extractErrorFromPiOutput,
 	extractTextFromPiOutput,
 	findExplicitImagePaths,
 	findExplicitMediaPaths,
-	findImagePlaceholderIds,
 	findImageReferences,
 	findInlineImagePaths,
 	formatMultiModalBackend,
@@ -19,12 +16,9 @@ import {
 	parseMultiModalBackend,
 	readAnalysisSessionModeSetting,
 	readMultiModalBackendSetting,
-	replaceExplicitInlineImagePathsWithPlaceholders,
-	replaceInlineImagePathsWithPlaceholders,
 	resolveShowImagesSetting,
 	SUPPORTED_IMAGE_EXTENSIONS,
 	SUPPORTED_VIDEO_EXTENSIONS,
-	sanitizeImagePromptForProvider,
 	supportsNativeImageInput,
 } from "./utils.js";
 
@@ -235,61 +229,12 @@ describe("inline image path helpers", () => {
 		expect(findExplicitMediaPaths(text)).toEqual(["./photo.png"]);
 	});
 
-	it("replaces inline image paths with numbered placeholders", () => {
-		const text = "What do you see? /tmp/a.png and ./b.webp";
-		expect(replaceInlineImagePathsWithPlaceholders(text)).toBe("What do you see? [Image #1] and [Image #2]");
-	});
-
-	it("replaces @-prefixed image paths without leaving the @ behind", () => {
-		const text = "Read @/tmp/a.png and @./b.webp";
-		expect(replaceInlineImagePathsWithPlaceholders(text)).toBe("Read [Image #1] and [Image #2]");
-	});
-
-	it("replaces only explicit @-prefixed image paths when requested", () => {
-		const text = "Read @/tmp/a.png and /tmp/b.webp";
-		expect(replaceExplicitInlineImagePathsWithPlaceholders(text)).toBe("Read [Image #1] and /tmp/b.webp");
-	});
-
-	it("preserves user newlines while replacing image paths", () => {
-		const text = "What do you see? /tmp/a.png\n\nAnswer in under 10 words\n\nBe concise";
-		expect(replaceInlineImagePathsWithPlaceholders(text)).toBe(
-			"What do you see? [Image #1]\n\nAnswer in under 10 words\n\nBe concise",
-		);
-	});
-
-	it("replaces only allowed image paths when provided", () => {
-		const text = "Read /tmp/a.png and /tmp/missing.png";
-		expect(replaceInlineImagePathsWithPlaceholders(text, ["/tmp/a.png"])).toBe("Read [Image #1] and /tmp/missing.png");
-	});
-
-	it("builds an image reference appendix with absolute paths", () => {
-		expect(buildImageReferenceSuffix(["/tmp/a.png", "/tmp/b.webp"])).toBe(
-			"\n\nImage references:\n[Image #1] /tmp/a.png\n[Image #2] /tmp/b.webp",
-		);
-	});
-
-	it("colorizes placeholders yellow for display", () => {
-		expect(colorizeImagePlaceholders("See [Image #1] and [Image #2]")).toBe(
-			"See \x1b[33m[Image #1]\x1b[39m and \x1b[33m[Image #2]\x1b[39m",
-		);
-	});
-
-	it("sanitizes display-only prompt additions before provider send", () => {
-		const text = "What do you see? \x1b[33m[Image #1]\x1b[39m\n\nImage references:\n[Image #1] /tmp/a.png";
-		expect(sanitizeImagePromptForProvider(text)).toBe("What do you see? [Image #1]");
-	});
-
-	it("finds placeholders and image paths in source order", () => {
-		const text = "See [Image #2] and @/tmp/a.png plus ./b.webp";
+	it("finds image paths in source order", () => {
+		const text = "See @/tmp/a.png plus ./b.webp";
 		expect(findImageReferences(text)).toEqual([
-			{ kind: "placeholder", fullMatch: "[Image #2]", index: 4, prefix: "", placeholderId: 2 },
-			{ kind: "path", fullMatch: " @/tmp/a.png", index: 18, prefix: " ", path: "/tmp/a.png" },
-			{ kind: "path", fullMatch: " ./b.webp", index: 35, prefix: " ", path: "./b.webp" },
+			{ kind: "path", fullMatch: " @/tmp/a.png", index: 3, prefix: " ", path: "/tmp/a.png" },
+			{ kind: "path", fullMatch: " ./b.webp", index: 20, prefix: " ", path: "./b.webp" },
 		]);
-	});
-
-	it("extracts placeholder ids in order", () => {
-		expect(findImagePlaceholderIds("[Image #3] [Image #12]")).toEqual([3, 12]);
 	});
 });
 

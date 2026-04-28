@@ -36,9 +36,7 @@ import {
 	parseMultiModalBackend,
 	readAnalysisSessionModeSetting,
 	readMultiModalBackendSetting,
-	replaceExplicitInlineImagePathsWithPlaceholders,
 	resolveShowImagesSetting,
-	sanitizeImagePromptForProvider,
 	supportsNativeImageInput,
 } from "./utils.js";
 
@@ -682,19 +680,40 @@ interface AnalyzeWithPiOptions {
 	signal?: AbortSignal;
 }
 
+type EffectiveAnalysisSessionMode = "isolated" | "fork";
+
+export function getAnalysisSessionAwarenessInstruction(mode: EffectiveAnalysisSessionMode): string {
+	if (mode === "fork") {
+		return [
+			"Conversation awareness: you are analyzing attached media inside a temporary fork of the current Pi conversation.",
+			"You may use available prior conversation context to interpret the user's intent, but ground every visual, video, or document claim in the attached media.",
+			"If the conversation context and the media conflict, say so explicitly instead of inventing missing evidence.",
+		].join(" ");
+	}
+
+	return [
+		"Conversation awareness: you are analyzing attached media without access to the prior conversation.",
+		"Do not assume unstated context from earlier chat turns; use only the attached media and this analysis prompt.",
+		"Ground every visual, video, or document claim in the attached media.",
+	].join(" ");
+}
+
 async function createAnalysisSessionArgs(
 	session: AnalysisSessionOptions | undefined,
-): Promise<{ args: string[]; cleanup: () => Promise<void> }> {
+): Promise<{ args: string[]; mode: EffectiveAnalysisSessionMode; cleanup: () => Promise<void> }> {
 	if (session?.mode === "fork" && session.sourceSessionFile && existsSync(session.sourceSessionFile)) {
 		const sessionDir = await mkdtemp(join(tmpdir(), "pi-multi-modal-session-"));
 		return {
 			args: ["--fork", session.sourceSessionFile, "--session-dir", sessionDir],
+			mode: "fork",
 			cleanup: () => rm(sessionDir, { recursive: true, force: true }),
 		};
 	}
 
-	return { args: ["--no-session"], cleanup: async () => undefined };
+	return { args: ["--no-session"], mode: "isolated", cleanup: async () => undefined };
 }
+
+export const createAnalysisSessionArgsForTest = createAnalysisSessionArgs;
 
 async function analyzeWithPi({
 	attachmentPaths,
@@ -704,6 +723,7 @@ async function analyzeWithPi({
 	signal,
 }: AnalyzeWithPiOptions): Promise<string> {
 	const analysisSession = await createAnalysisSessionArgs(session);
+	const promptWithAwareness = `${getAnalysisSessionAwarenessInstruction(analysisSession.mode)}\n\n${prompt}`;
 	try {
 		return await new Promise((resolvePromise, reject) => {
 			const args = [
@@ -721,7 +741,7 @@ async function analyzeWithPi({
 				"--no-context-files",
 				"--no-extensions",
 				"-p",
-				prompt,
+				promptWithAwareness,
 			];
 
 			const childEnv = { ...process.env };
@@ -1682,44 +1702,21 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		for (const message of messages) {
-			if (message.role !== "user") {
-				continue;
-			}
-			if (typeof message.content === "string") {
-				const sanitized = replaceExplicitInlineImagePathsWithPlaceholders(
-					sanitizeImagePromptForProvider(message.content),
-				);
-				if (sanitized !== message.content) {
-					message.content = sanitized;
-					changed = true;
-				}
+			if (message.role !== "user" || typeof message.content === "string") {
 				continue;
 			}
 
 			const imageBlocks = message.content.filter((block) => block.type === "image");
-			const textBlocks = message.content
-				.filter((block) => block.type === "text")
-				.map((block) => {
-					const sanitized = replaceExplicitInlineImagePathsWithPlaceholders(sanitizeImagePromptForProvider(block.text));
-					if (sanitized !== block.text) {
-						changed = true;
-					}
-					return { ...block, text: sanitized };
-				});
-			const otherBlocks = message.content.filter((block) => block.type !== "image" && block.type !== "text");
+			if (imageBlocks.length === 0) {
+				continue;
+			}
 
-			if (imageBlocks.length > 0) {
-				const reordered = [...imageBlocks, ...textBlocks, ...otherBlocks];
-				if (JSON.stringify(reordered) !== JSON.stringify(message.content)) {
-					message.content = reordered;
-					changed = true;
-				}
-			} else if (textBlocks.length > 0 || otherBlocks.length > 0) {
-				const rebuilt = [...textBlocks, ...otherBlocks];
-				if (JSON.stringify(rebuilt) !== JSON.stringify(message.content)) {
-					message.content = rebuilt;
-					changed = true;
-				}
+			const textBlocks = message.content.filter((block) => block.type === "text");
+			const otherBlocks = message.content.filter((block) => block.type !== "image" && block.type !== "text");
+			const reordered = [...imageBlocks, ...textBlocks, ...otherBlocks];
+			if (JSON.stringify(reordered) !== JSON.stringify(message.content)) {
+				message.content = reordered;
+				changed = true;
 			}
 		}
 

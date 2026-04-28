@@ -25,21 +25,13 @@ const INLINE_IMAGE_PATH_REGEX = /(^|\s|\(|:|\[)(@?((?:~|\/|\.\.?\/)[^\s)\]}"']+\
 const INLINE_EXPLICIT_MEDIA_PATH_REGEX = /(^|\s|\(|:|\[)(@((?:~|\/|\.\.?\/)[^\s)\]}"']+\.[a-z0-9]+))/gim;
 export const PI_BASH_IMAGE_MARKER_PREFIX = "__PI_IMAGE_MARKER__:";
 
-type ImageReferenceMatch =
-	| {
-			kind: "placeholder";
-			fullMatch: string;
-			index: number;
-			prefix: "";
-			placeholderId: number;
-	  }
-	| {
-			kind: "path";
-			fullMatch: string;
-			index: number;
-			prefix: string;
-			path: string;
-	  };
+type ImageReferenceMatch = {
+	kind: "path";
+	fullMatch: string;
+	index: number;
+	prefix: string;
+	path: string;
+};
 
 // Types for pi JSON output
 interface PiMessage {
@@ -235,40 +227,8 @@ export function findExplicitMediaPaths(text: string): string[] {
 
 export function findExplicitImagePaths(text: string): string[] {
 	return findImageReferences(text)
-		.filter((match): match is Extract<ImageReferenceMatch, { kind: "path" }> => match.kind === "path")
 		.filter((match) => match.fullMatch.slice(match.prefix.length).startsWith("@"))
 		.map((match) => match.path);
-}
-
-/**
- * Replace inline local image paths with stable placeholders like [Image #1].
- * Replacement happens in match order and preserves surrounding punctuation/spacing.
- */
-export function replaceInlineImagePathsWithPlaceholders(text: string, allowedPaths?: string[]): string {
-	let imageIndex = 0;
-	const allowed = allowedPaths ? new Set(allowedPaths) : undefined;
-	return text.replaceAll(INLINE_IMAGE_PATH_REGEX, (fullMatch, prefix, _reference, path) => {
-		if (allowed && !allowed.has(path)) {
-			return fullMatch;
-		}
-		imageIndex += 1;
-		return `${prefix}[Image #${imageIndex}]`;
-	});
-}
-
-export function replaceExplicitInlineImagePathsWithPlaceholders(text: string, allowedPaths?: string[]): string {
-	let imageIndex = 0;
-	const allowed = allowedPaths ? new Set(allowedPaths) : undefined;
-	return text.replaceAll(INLINE_IMAGE_PATH_REGEX, (fullMatch, prefix, reference, path) => {
-		if (!String(reference).startsWith("@")) {
-			return fullMatch;
-		}
-		if (allowed && !allowed.has(path)) {
-			return fullMatch;
-		}
-		imageIndex += 1;
-		return `${prefix}[Image #${imageIndex}]`;
-	});
 }
 
 export function findImageReferences(text: string): ImageReferenceMatch[] {
@@ -284,62 +244,7 @@ export function findImageReferences(text: string): ImageReferenceMatch[] {
 		}
 	}
 
-	for (const match of text.matchAll(IMAGE_PLACEHOLDER_REGEX)) {
-		const fullMatch = match[0];
-		const placeholderId = Number.parseInt(match[1] ?? "", 10);
-		const index = match.index;
-		if (fullMatch !== undefined && Number.isFinite(placeholderId) && index !== undefined) {
-			matches.push({ kind: "placeholder", fullMatch, index, prefix: "", placeholderId });
-		}
-	}
-
 	return matches.sort((a, b) => a.index - b.index);
-}
-
-/**
- * Build a stable appendix mapping placeholders back to absolute image paths.
- */
-export function buildImageReferenceSuffix(absolutePaths: string[]): string {
-	if (absolutePaths.length === 0) {
-		return "";
-	}
-
-	const lines = absolutePaths.map((path, index) => `[Image #${index + 1}] ${path}`);
-	return `\n\nImage references:\n${lines.join("\n")}`;
-}
-
-const IMAGE_PLACEHOLDER_REGEX = /\[Image #(\d+)\]/g;
-
-export function findImagePlaceholderIds(text: string): number[] {
-	const matches: number[] = [];
-	for (const match of text.matchAll(IMAGE_PLACEHOLDER_REGEX)) {
-		const id = Number.parseInt(match[1] ?? "", 10);
-		if (Number.isFinite(id)) {
-			matches.push(id);
-		}
-	}
-	return matches;
-}
-const IMAGE_REFERENCE_SUFFIX_REGEX = /\n\nImage references:\n(?:\[Image #\d+\] .*\n?)*$/;
-const YELLOW_START = "\x1b[33m";
-const COLOR_RESET = "\x1b[39m";
-
-/**
- * Colorize [Image #n] placeholders for terminal display.
- */
-export function colorizeImagePlaceholders(text: string): string {
-	return text.replaceAll(IMAGE_PLACEHOLDER_REGEX, (match) => `${YELLOW_START}${match}${COLOR_RESET}`);
-}
-
-/**
- * Remove display-only styling and image-reference appendix before sending text to the provider.
- */
-export function sanitizeImagePromptForProvider(text: string): string {
-	return text
-		.replaceAll(YELLOW_START, "")
-		.replaceAll(COLOR_RESET, "")
-		.replace(IMAGE_REFERENCE_SUFFIX_REGEX, "")
-		.trimEnd();
 }
 
 function readBooleanSetting(settings: unknown, path: readonly string[]): boolean | undefined {
