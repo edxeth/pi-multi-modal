@@ -2,16 +2,16 @@
  * Utility functions for pi-multi-modal.
  */
 
-export const DEFAULT_MULTI_MODAL_PROVIDER = "zai";
-export const DEFAULT_MULTI_MODAL_MODEL = "glm-4.6v";
-export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+const DEFAULT_MULTI_MODAL_PROVIDER = "zai";
+const DEFAULT_MULTI_MODAL_MODEL = "glm-4.6v";
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export interface MultiModalBackendConfig {
 	provider: string;
 	model: string;
 	thinkingLevel?: ThinkingLevel;
 }
-export const ANALYSIS_SESSION_MODES = ["isolated", "fork"] as const;
+const ANALYSIS_SESSION_MODES = ["isolated", "fork"] as const;
 export type AnalysisSessionMode = (typeof ANALYSIS_SESSION_MODES)[number];
 export const DEFAULT_ANALYSIS_SESSION_MODE: AnalysisSessionMode = "isolated";
 export const DEFAULT_MULTI_MODAL_BACKEND: MultiModalBackendConfig = {
@@ -20,12 +20,12 @@ export const DEFAULT_MULTI_MODAL_BACKEND: MultiModalBackendConfig = {
 };
 export const SUPPORTED_IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp"];
 export const SUPPORTED_VIDEO_EXTENSIONS = ["mp4", "mkv", "mov"];
-export const SUPPORTED_PDF_EXTENSIONS = ["pdf"];
+const SUPPORTED_PDF_EXTENSIONS = ["pdf"];
 const INLINE_IMAGE_PATH_REGEX = /(^|\s|\(|:|\[)(@?((?:~|\/|\.\.?\/)[^\s)\]}"']+\.(?:jpg|jpeg|png|gif|webp)))/gim;
 const INLINE_EXPLICIT_MEDIA_PATH_REGEX = /(^|\s|\(|:|\[)(@((?:~|\/|\.\.?\/)[^\s)\]}"']+\.[a-z0-9]+))/gim;
 export const PI_BASH_IMAGE_MARKER_PREFIX = "__PI_IMAGE_MARKER__:";
 
-export type ImageReferenceMatch =
+type ImageReferenceMatch =
 	| {
 			kind: "placeholder";
 			fullMatch: string;
@@ -42,21 +42,21 @@ export type ImageReferenceMatch =
 	  };
 
 // Types for pi JSON output
-export interface PiMessage {
+interface PiMessage {
 	role: string;
 	content?: PiContentBlock[];
 }
 
-export interface PiContentBlock {
+interface PiContentBlock {
 	type: string;
 	text?: string;
 }
 
-export interface PiJsonOutput {
+interface PiJsonOutput {
 	messages?: PiMessage[];
 }
 
-export type BashImageOutputPart =
+type BashImageOutputPart =
 	| {
 			type: "text";
 			text: string;
@@ -66,11 +66,11 @@ export type BashImageOutputPart =
 			path: string;
 	  };
 
-export function isThinkingLevel(value: string | undefined): value is ThinkingLevel {
+function isThinkingLevel(value: string | undefined): value is ThinkingLevel {
 	return value !== undefined && THINKING_LEVELS.includes(value as ThinkingLevel);
 }
 
-export function isAnalysisSessionMode(value: string | undefined): value is AnalysisSessionMode {
+function isAnalysisSessionMode(value: string | undefined): value is AnalysisSessionMode {
 	return value !== undefined && ANALYSIS_SESSION_MODES.includes(value as AnalysisSessionMode);
 }
 
@@ -189,7 +189,7 @@ export function isPdfFile(path: string): boolean {
 	return ext !== undefined && SUPPORTED_PDF_EXTENSIONS.includes(ext);
 }
 
-export function isMediaFile(path: string): boolean {
+function isMediaFile(path: string): boolean {
 	return isImageFile(path) || isVideoFile(path) || isPdfFile(path);
 }
 
@@ -467,8 +467,12 @@ export function extractErrorFromPiOutput(output: string): string | null {
 		.map((line) => line.trim())
 		.filter(Boolean);
 	for (let i = lines.length - 1; i >= 0; i -= 1) {
+		const line = lines[i];
+		if (!line) {
+			continue;
+		}
 		try {
-			const error = extractErrorFromPiJson(JSON.parse(lines[i]!));
+			const error = extractErrorFromPiJson(JSON.parse(line));
 			if (error) {
 				return error;
 			}
@@ -495,8 +499,12 @@ export function extractTextFromPiOutput(output: string): string {
 		.map((line) => line.trim())
 		.filter(Boolean);
 	for (let i = lines.length - 1; i >= 0; i -= 1) {
+		const line = lines[i];
+		if (!line) {
+			continue;
+		}
 		try {
-			const text = extractTextFromPiJson(JSON.parse(lines[i]!));
+			const text = extractTextFromPiJson(JSON.parse(line));
 			if (text) {
 				return text;
 			}

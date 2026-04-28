@@ -184,7 +184,7 @@ type AttachmentIndicatorCtx = {
 	ui: {
 		setWidget: (
 			key: string,
-			content: string[] | ((tui: any, theme: any) => any) | undefined,
+			content: string[] | undefined,
 			options?: { placement?: "aboveEditor" | "belowEditor" },
 		) => void;
 		getEditorText: () => string;

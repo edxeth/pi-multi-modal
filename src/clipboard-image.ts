@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { createRequire } from "node:module";
 
-export type ClipboardImage = {
+type ClipboardImage = {
 	bytes: Uint8Array;
 	mimeType: string;
 };
@@ -37,7 +37,7 @@ function getClipboardModule(): { hasImage(): boolean; getImageBinary(): Promise<
 	}
 }
 
-export function isWaylandSession(env = process.env): boolean {
+function isWaylandSession(env = process.env): boolean {
 	return Boolean(env.WAYLAND_DISPLAY) || env.XDG_SESSION_TYPE === "wayland";
 }
 
@@ -242,7 +242,7 @@ export async function readClipboardImage(options?: {
 		image ??= readClipboardImageViaWindowsPowerShell(env);
 	} else {
 		const clipboard = getClipboardModule();
-		if (!clipboard || !clipboard.hasImage()) {
+		if (!clipboard?.hasImage()) {
 			return null;
 		}
 		const imageData = await clipboard.getImageBinary();

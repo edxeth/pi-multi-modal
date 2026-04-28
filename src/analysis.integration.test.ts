@@ -1,13 +1,14 @@
 /**
  * Integration tests for pi-multi-modal.
  *
- * These tests spawn pi with the default pi-multi-modal backend and verify real image analysis.
+ * These tests spawn pi with an explicit test backend and verify real image analysis.
  * They are slow and consume API credits, so run them purposefully:
  *
- *   npm run test:integration
+ *   PI_MULTI_MODAL_TEST_BACKEND=<provider/model[:thinking]> npm run test:integration
  *
  * Prerequisites:
- * - Credentials available for the configured backend (default: zai/glm-4.6v)
+ * - PI_MULTI_MODAL_TEST_BACKEND set to a Pi-registered vision-capable model
+ * - Credentials available for that provider
  * - Sample images in test-fixtures/ directory (see README)
  */
 
@@ -16,10 +17,31 @@ import { existsSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MULTI_MODAL_BACKEND, extractTextFromPiOutput } from "./utils.js";
+import { extractTextFromPiOutput, type MultiModalBackendConfig, parseMultiModalBackend } from "./utils.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = resolvePath(__dirname, "../test-fixtures");
+const TEST_BACKEND_ENV_VAR = "PI_MULTI_MODAL_TEST_BACKEND";
+
+function readIntegrationBackend(): MultiModalBackendConfig {
+	const raw = process.env[TEST_BACKEND_ENV_VAR];
+	if (!raw) {
+		throw new Error(
+			`${TEST_BACKEND_ENV_VAR} is required for integration tests. ` +
+				`Ask the user which provider/model[:thinking] to use, then run for example: ` +
+				`${TEST_BACKEND_ENV_VAR}=zai-messages/glm-5v-turbo npm run test:integration`,
+		);
+	}
+
+	const parsed = parseMultiModalBackend(raw);
+	if (!parsed) {
+		throw new Error(`${TEST_BACKEND_ENV_VAR} must be <provider/model[:thinking]>, got: ${raw}`);
+	}
+
+	return parsed;
+}
+
+const TEST_BACKEND = readIntegrationBackend();
 
 // Embedded analysis prompt (same as in index.ts)
 const ANALYSIS_PROMPT = `You are analyzing an image. Follow these steps:
@@ -128,16 +150,17 @@ const TEST_IMAGES: Record<string, { file: string; expectedCategory: string; keyw
 };
 
 /**
- * Spawn pi with the default pi-multi-modal backend to analyze an image.
+ * Spawn pi with the explicit integration-test backend to analyze an image.
  */
 async function analyzeImageWithPi(imagePath: string, useStructuredPrompt = false): Promise<string> {
 	return new Promise((resolvePromise, reject) => {
 		const args = [
 			`@${imagePath}`,
 			"--provider",
-			DEFAULT_MULTI_MODAL_BACKEND.provider,
+			TEST_BACKEND.provider,
 			"--model",
-			DEFAULT_MULTI_MODAL_BACKEND.model,
+			TEST_BACKEND.model,
+			...(TEST_BACKEND.thinkingLevel ? ["--thinking", TEST_BACKEND.thinkingLevel] : []),
 			"-p",
 			useStructuredPrompt ? ANALYSIS_PROMPT : "Analyze this image comprehensively.",
 			"--mode",

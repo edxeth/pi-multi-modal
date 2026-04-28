@@ -209,6 +209,14 @@ npm test
 npx tsc --noEmit
 ```
 
+Integration tests call a real vision backend and require an explicit test target:
+
+```bash
+PI_MULTI_MODAL_TEST_BACKEND=zai-messages/glm-5v-turbo npm run test:integration
+```
+
+Use any Pi-registered vision-capable model in `<provider/model[:thinking]>` form. Do not rely on personal `~/.pi/agent/settings.json` for integration tests.
+
 See [test-fixtures/README.md](./test-fixtures/README.md) for fixture details and benchmarks.
 
 ## License

@@ -20,10 +20,12 @@
 		"src"
 	],
 	"scripts": {
-		"format": "biome format --write .",
-		"lint": "biome lint .",
+		"format": "npx @biomejs/biome@latest format --write .",
+		"lint": "npx @biomejs/biome@latest lint .",
+		"knip": "npx knip@latest",
 		"typecheck": "tsc --noEmit",
-		"check": "biome check . && tsc --noEmit",
+		"check": "npx @biomejs/biome@latest check . && tsc --noEmit",
+		"verify": "npm run check && npm run knip && npm test",
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"test:integration": "vitest run --config vitest.integration.config.ts",
@@ -47,8 +49,11 @@
 		"@mariozechner/pi-coding-agent": "*",
 		"@mariozechner/pi-tui": "*"
 	},
+	"optionalDependencies": {
+		"@mariozechner/clipboard": "^0.3.3",
+		"@silvia-odwyer/photon-node": "^0.3.4"
+	},
 	"devDependencies": {
-		"@biomejs/biome": "^2.3.13",
 		"@mariozechner/pi-ai": "^0.68.1",
 		"@mariozechner/pi-coding-agent": "^0.68.1",
 		"@mariozechner/pi-tui": "^0.68.1",
