@@ -21,6 +21,32 @@ python make-chart.py && __PI_IMAGE__ chart.png
 
 That is the whole idea: local media should feel like normal pi context.
 
+## Clipboard images
+
+`pi-multi-modal` does not replace pi's native clipboard paste shortcut. The most portable clipboard workflow is:
+
+```text
+@<native pi image paste>
+```
+
+In practice, type `@` in the prompt, then use pi's normal image paste keybinding. On Linux that is typically `Ctrl+V`, which inserts a temporary path such as:
+
+```text
+/tmp/pi-clipboard-1234.png
+```
+
+Together, the prompt becomes:
+
+```text
+@/tmp/pi-clipboard-1234.png
+```
+
+That is just an explicit media reference, so `pi-multi-modal` handles it the same way it handles `@./screenshot.png`.
+
+This keeps terminal text paste (`Ctrl+Shift+V` in many terminals) independent from image attachment behavior. It also avoids terminal-specific smart-paste routing, which varies across Linux, macOS, Windows, tmux, and terminal emulators.
+
+Platform note: this workflow works wherever pi's native image paste can create a local image file path and insert it into the prompt. `pi-multi-modal` then consumes the resulting `@path`; it does not need to own the clipboard shortcut itself.
+
 ## How it behaves
 
 ### Image-capable models

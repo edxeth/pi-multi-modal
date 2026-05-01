@@ -20,12 +20,12 @@
 		"src"
 	],
 	"scripts": {
-		"format": "npx @biomejs/biome@latest format --write .",
-		"lint": "npx @biomejs/biome@latest lint .",
-		"knip": "npx knip@latest",
+		"format": "bunx @biomejs/biome@latest format --write .",
+		"lint": "bunx @biomejs/biome@latest lint .",
+		"knip": "bunx knip@latest",
 		"typecheck": "tsc --noEmit",
-		"check": "npx @biomejs/biome@latest check . && tsc --noEmit",
-		"verify": "npm run check && npm run knip && npm test",
+		"check": "bunx @biomejs/biome@latest check . && tsc --noEmit",
+		"verify": "bun run check && bun run knip && bun run test",
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"test:integration": "vitest run --config vitest.integration.config.ts",
@@ -61,5 +61,9 @@
 		"@types/node": "^25.2.0",
 		"typescript": "^5.9.3",
 		"vitest": "^4.0.18"
-	}
+	},
+	"trustedDependencies": [
+		"koffi",
+		"protobufjs"
+	]
 }
