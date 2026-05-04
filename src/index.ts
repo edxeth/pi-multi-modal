@@ -191,8 +191,6 @@ type AttachmentIndicatorCtx = {
 
 const ATTACHMENT_INDICATOR_WIDGET_KEY = "multi-modal-attachment-indicator";
 const ATTACHMENT_INDICATOR_POLL_MS = 250;
-const EXPLICIT_MEDIA_ANALYSIS_CONCURRENCY = 3;
-
 function mimeTypeForImagePath(path: string): ImageContent["mimeType"] | undefined {
 	const ext = path.split(".").pop()?.toLowerCase();
 	switch (ext) {
@@ -735,8 +733,6 @@ async function analyzeWithPi({
 				backend.model,
 				...(backend.thinkingLevel ? ["--thinking", backend.thinkingLevel] : []),
 				"--print",
-				"--mode",
-				"json",
 				"--no-skills",
 				"--no-context-files",
 				"--no-extensions",
@@ -781,11 +777,6 @@ async function analyzeWithPi({
 				}
 
 				const text = extractTextFromPiOutput(output);
-				if (text === output && output.startsWith("{")) {
-					reject(new Error("pi subprocess returned no assistant text"));
-					return;
-				}
-
 				resolvePromise(text);
 			});
 
@@ -1025,6 +1016,136 @@ async function analyzeVideo({ absolutePath, backend, session, signal }: AnalyzeV
 			setTimeout(() => {
 				void rm(framesDir, { recursive: true, force: true });
 			}, 30_000);
+		}
+	}
+}
+
+// ── Batch analysis functions (group same-type assets into one child process) ──────────
+
+async function analyzeImageBatch(
+	absolutePaths: string[],
+	options: {
+		backend: MultiModalBackendConfig;
+		session?: AnalysisSessionOptions;
+		signal?: AbortSignal;
+	},
+): Promise<string> {
+	const prompt =
+		absolutePaths.length === 1
+			? IMAGE_ANALYSIS_PROMPT
+			: `You are analyzing ${absolutePaths.length} images. For each image, provide separate analysis using the template below. Clearly separate each image's analysis.
+
+${IMAGE_ANALYSIS_PROMPT}`;
+
+	return analyzeWithPi({
+		attachmentPaths: absolutePaths,
+		prompt,
+		backend: options.backend,
+		session: options.session,
+		signal: options.signal,
+	});
+}
+
+async function analyzeVideoBatch(
+	absolutePaths: string[],
+	options: {
+		backend: MultiModalBackendConfig;
+		session?: AnalysisSessionOptions;
+		signal?: AbortSignal;
+	},
+): Promise<string> {
+	const framesDirs: string[] = [];
+	const allFrames: string[] = [];
+	let succeeded = false;
+
+	try {
+		for (const absPath of absolutePaths) {
+			const framesDir = await mkdtemp(join(process.cwd(), ".pi-multi-modal-frames-"));
+			framesDirs.push(framesDir);
+			const frames = await extractVideoFrames(absPath, framesDir, options.signal);
+			if (frames.length === 0) {
+				throw new Error(`No frames could be extracted from video: ${absPath}`);
+			}
+			allFrames.push(...frames);
+		}
+
+		const prompt =
+			absolutePaths.length === 1
+				? VIDEO_ANALYSIS_PROMPT
+				: `You are analyzing ${absolutePaths.length} videos. The keyframes below are from all videos in order. Analyze each video separately.
+
+${VIDEO_ANALYSIS_PROMPT}`;
+
+		const text = await analyzeWithPi({
+			attachmentPaths: allFrames,
+			prompt,
+			backend: options.backend,
+			session: options.session,
+			signal: options.signal,
+		});
+		succeeded = true;
+		return text;
+	} finally {
+		for (const dir of framesDirs) {
+			if (succeeded) {
+				await rm(dir, { recursive: true, force: true });
+			} else {
+				setTimeout(() => {
+					void rm(dir, { recursive: true, force: true });
+				}, 30_000);
+			}
+		}
+	}
+}
+
+async function analyzePdfBatch(
+	absolutePaths: string[],
+	options: {
+		backend: MultiModalBackendConfig;
+		session?: AnalysisSessionOptions;
+		signal?: AbortSignal;
+	},
+): Promise<string> {
+	const pagesDirs: string[] = [];
+	const allPages: string[] = [];
+	let succeeded = false;
+
+	try {
+		for (const absPath of absolutePaths) {
+			const pagesDir = await mkdtemp(join(process.cwd(), ".pi-multi-modal-pdf-"));
+			pagesDirs.push(pagesDir);
+			const pages = await extractPdfPages(absPath, pagesDir, options.signal);
+			if (pages.length === 0) {
+				throw new Error(`No pages could be extracted from PDF: ${absPath}`);
+			}
+			allPages.push(...pages);
+		}
+
+		const prompt =
+			absolutePaths.length === 1
+				? PDF_ANALYSIS_PROMPT
+				: `You are analyzing ${absolutePaths.length} PDF documents. The pages below are from all documents in order. Analyze each document separately.
+
+${PDF_ANALYSIS_PROMPT}`;
+
+		const text = await analyzeWithPi({
+			attachmentPaths: allPages,
+			prompt: `${prompt}\n\nThe attached images are rendered pages from PDF documents in order.`,
+			backend: options.backend,
+			session: options.session,
+			signal: options.signal,
+		});
+		succeeded = true;
+		return text;
+	} finally {
+		for (const dir of pagesDirs) {
+			if (succeeded) {
+				await rm(dir, { recursive: true, force: true });
+			} else {
+				setTimeout(() => {
+					void rm(dir, { recursive: true, force: true });
+				}, 30_000);
+			}
 		}
 	}
 }
@@ -1299,39 +1420,77 @@ async function analyzeExplicitMediaReferences(
 		return "";
 	}
 
-	const sections = new Array<string>(references.length);
-	let nextIndex = 0;
-	const workerCount = Math.min(EXPLICIT_MEDIA_ANALYSIS_CONCURRENCY, references.length);
+	const sections: string[] = [];
+	const errors: string[] = [];
 
-	await Promise.all(
-		Array.from({ length: workerCount }, async () => {
-			while (nextIndex < references.length) {
-				const index = nextIndex;
-				nextIndex += 1;
-				const reference = references[index];
+	// Group by type for batching
+	const imageRefs: Array<{ path: string; absolutePath: string }> = [];
+	const videoRefs: Array<{ path: string; absolutePath: string }> = [];
+	const pdfRefs: Array<{ path: string; absolutePath: string }> = [];
 
-				try {
-					const result = await analyzeMediaToolResult(reference.absolutePath, {
-						...reference.flags,
-						backend: options.backend,
-						session: options.session,
-					});
-					const text = result.content
-						.filter((block): block is ToolTextBlock => block.type === "text")
-						.map((block) => block.text)
-						.join("\n\n");
-					sections[index] = `Path: ${reference.path}\n${text}`;
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					sections[index] = `Path: ${reference.path}\n[Media analysis failed]\n\n${message}`;
-				}
-			}
-		}),
-	);
+	for (const ref of references) {
+		const entry = { path: ref.path, absolutePath: ref.absolutePath };
+		if (ref.flags.image) imageRefs.push(entry);
+		else if (ref.flags.video) videoRefs.push(entry);
+		else if (ref.flags.pdf) pdfRefs.push(entry);
+	}
+
+	// Batch images
+	if (imageRefs.length > 0) {
+		try {
+			const absPaths = imageRefs.map((r) => r.absolutePath);
+			const text = await analyzeImageBatch(absPaths, {
+				backend: options.backend,
+				session: options.session,
+			});
+			sections.push(`Path: ${imageRefs.map((r) => r.path).join(", ")}\n${text}`);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			errors.push(`Path: ${imageRefs.map((r) => r.path).join(", ")}\n[Image analysis failed]\n\n${message}`);
+		}
+	}
+
+	// Batch videos
+	if (videoRefs.length > 0) {
+		try {
+			const absPaths = videoRefs.map((r) => r.absolutePath);
+			const text = await analyzeVideoBatch(absPaths, {
+				backend: options.backend,
+				session: options.session,
+			});
+			sections.push(`Path: ${videoRefs.map((r) => r.path).join(", ")}\n${text}`);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			errors.push(`Path: ${videoRefs.map((r) => r.path).join(", ")}\n[Video analysis failed]\n\n${message}`);
+		}
+	}
+
+	// Batch PDFs
+	if (pdfRefs.length > 0) {
+		try {
+			const absPaths = pdfRefs.map((r) => r.absolutePath);
+			const text = await analyzePdfBatch(absPaths, {
+				backend: options.backend,
+				session: options.session,
+			});
+			sections.push(`Path: ${pdfRefs.map((r) => r.path).join(", ")}\n${text}`);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			errors.push(`Path: ${pdfRefs.map((r) => r.path).join(", ")}\n[PDF analysis failed]\n\n${message}`);
+		}
+	}
+
+	if (sections.length === 0 && errors.length > 0) {
+		return [
+			"The following explicit @media references were analyzed before the agent response.",
+			...errors,
+		].join("\n\n");
+	}
 
 	return [
 		"The following explicit @media references were analyzed before the agent response. Use these results as the contents of the referenced files.",
 		...sections,
+		...errors,
 	].join("\n\n");
 }
 
