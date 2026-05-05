@@ -835,6 +835,7 @@ async function createAnalysisSessionArgs(
 	return { args: ["--no-session"], mode: "isolated", cleanup: async () => undefined };
 }
 
+/** @internal Exported for unit tests in tests/ */
 export const createAnalysisSessionArgsForTest = createAnalysisSessionArgs;
 
 async function analyzeWithPi({

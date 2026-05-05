@@ -17,7 +17,7 @@ import { existsSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { extractTextFromPiOutput, type MultiModalBackendConfig, parseMultiModalBackend } from "./utils.js";
+import { extractTextFromPiOutput, type MultiModalBackendConfig, parseMultiModalBackend } from "../src/utils.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = resolvePath(__dirname, "../test-fixtures");

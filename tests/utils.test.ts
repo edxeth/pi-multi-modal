@@ -20,7 +20,7 @@ import {
 	SUPPORTED_IMAGE_EXTENSIONS,
 	SUPPORTED_VIDEO_EXTENSIONS,
 	supportsNativeImageInput,
-} from "./utils.js";
+} from "../src/utils.js";
 
 describe("multi-modal backend helpers", () => {
 	it("parses provider, model, and optional thinking level", () => {

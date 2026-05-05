@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createAnalysisSessionArgsForTest, getAnalysisSessionAwarenessInstruction } from "./index.js";
+import { createAnalysisSessionArgsForTest, getAnalysisSessionAwarenessInstruction } from "../src/index.js";
 
 describe("analysis session awareness", () => {
 	it("describes isolated analysis as having no prior conversation", () => {
