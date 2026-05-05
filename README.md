@@ -218,31 +218,7 @@ Install globally:
 pi install git:github.com/edxeth/pi-multi-modal
 ```
 
-Install for the current project:
-
-```bash
-pi install -l git:github.com/edxeth/pi-multi-modal
-```
-
-Try it without installing:
-
-```bash
-pi -e git:github.com/edxeth/pi-multi-modal
-```
-
 ## Development
-
-```bash
-npm install
-npm test
-npx tsc --noEmit
-```
-
-Full local check:
-
-```bash
-npm run check
-```
 
 Integration tests call a real vision backend. Pick an explicit pi-registered image model:
 

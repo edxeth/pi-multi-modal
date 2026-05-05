@@ -722,30 +722,59 @@ export function getAnalysisSessionAwarenessInstruction(mode: EffectiveAnalysisSe
 	].join(" ");
 }
 
+/** Find the last assistant message's exact token count from usage.input. */
+function getLastAssistantInput(entries: Array<{ line: string; parsed: Record<string, unknown> }>): number | undefined {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.parsed.type !== "message") continue;
+		const msg = entry.parsed.message as Record<string, unknown> | undefined;
+		if (msg?.role !== "assistant") continue;
+		const usage = msg.usage as Record<string, unknown> | undefined;
+		const input = usage?.input;
+		if (typeof input === "number") return input;
+	}
+	return undefined;
+}
+
+/** Build exact token costs per entry by diffing consecutive assistant usage.input values. */
+function buildExactTokenCosts(entries: Array<{ line: string; parsed: Record<string, unknown> }>): Map<string, number> {
+	const costs = new Map<string, number>();
+	let previousInput = 0;
+
+	for (const entry of entries) {
+		const id = entry.parsed.id as string | undefined;
+		if (!id) continue;
+
+		if (entry.parsed.type === "message") {
+			const msg = entry.parsed.message as Record<string, unknown> | undefined;
+			if (msg?.role === "assistant") {
+				const usage = msg.usage as Record<string, unknown> | undefined;
+				const input = usage?.input;
+				if (typeof input === "number") {
+					const cost = input - previousInput;
+					costs.set(id, cost > 0 ? cost : 0);
+					previousInput = input;
+					continue;
+				}
+			}
+		}
+		// Fallback: rough estimate for non-assistant entries
+		costs.set(id, entry.line.length / 4);
+	}
+
+	return costs;
+}
+
 async function createAnalysisSessionArgs(
 	session: AnalysisSessionOptions | undefined,
 ): Promise<{ args: string[]; mode: EffectiveAnalysisSessionMode; cleanup: () => Promise<void> }> {
 	if (session?.mode === "fork" && session.sourceSessionFile && existsSync(session.sourceSessionFile)) {
 		const sessionDir = await mkdtemp(join(tmpdir(), "pi-multi-modal-session-"));
 
-		// Determine the token budget for trimming the forked session.
-		// The session file on disk can be much larger than the parent's active
-		// memory context (e.g. 553K tokens vs 130K tokens). Forking the raw
-		// session file would pass all that stale history to the vision model,
-		// causing silent empty output when it exceeds the model's context window.
-		//
-		// Formula:
-		//   budget = analysis_model_context_window - reserved_output_tokens
-		//   Walk the parentId chain from the last entry, collecting entries
-		//   until we hit the budget limit.
-		//
-		// Token count is taken from the last assistant message's usage.input,
-		// which pi already tracks exactly per provider tokenizer. This is far
-		// more accurate than estimating from text length.
 		const RESERVE_OUTPUT_TOKENS = session.reservedOutputTokens ?? 10_000;
 		const budget = session.analysisModelContextWindow
 			? session.analysisModelContextWindow - RESERVE_OUTPUT_TOKENS
-			: 200_000; // fallback if we can't look up the model
+			: undefined;
 
 		const trimmedFile = join(sessionDir, "trimmed-source.jsonl");
 		try {
@@ -763,42 +792,46 @@ async function createAnalysisSessionArgs(
 			const headerEntry = entries.find((e) => e.parsed.type === "session");
 			if (!headerEntry) throw new Error("No session header");
 
-			// Build entry map for parentId traversal
 			const entryMap = new Map<string, (typeof entries)[0]>();
 			for (const entry of entries) {
 				if (entry.parsed.id) entryMap.set(entry.parsed.id as string, entry);
 			}
 
-			// Walk parentId chain from the last entry, collecting within budget.
-			// Since we know the exact session token count from usage.input,
-			// we estimate older entries proportionally from text content length.
-			// This is imprecise but the budget is a soft ceiling — being off by
-			// a few entries doesn't break anything.
+			// Build exact token costs per entry by walking forward and computing
+			// differences between consecutive assistant messages' usage.input.
+			// Non-assistant entries get estimated from line length.
+			const exactCosts = buildExactTokenCosts(entries);
+
 			const activeIds = new Set<string>();
 			let current: (typeof entries)[0] | undefined = entries[entries.length - 1];
-			let tokenCount = 0;
-			while (current?.parsed.id) {
-				activeIds.add(current.parsed.id as string);
 
-				// Estimate token count from text content (rough: 4 chars per token)
-				if (current.parsed.type === "message") {
-					const msg = current.parsed.message as Record<string, unknown> | undefined;
-					const content = msg?.content;
-					if (Array.isArray(content)) {
-						for (const block of content) {
-							if (typeof block === "object" && block && (block as Record<string, unknown>).type === "text") {
-								tokenCount += (((block as Record<string, unknown>).text as string) ?? "").length / 4;
-							}
-						}
+			// Check if the session already fits within budget using the exact token
+			// count from the last assistant message (pi tracks this in usage.input).
+			// If it fits, collect everything — no estimation needed.
+			if (budget !== undefined) {
+				const lastAssistantInput = getLastAssistantInput(entries);
+				if (lastAssistantInput !== undefined && lastAssistantInput < budget) {
+					// Collect all entries — the whole session fits within budget
+					for (const entry of entries) {
+						if (entry.parsed.id) activeIds.add(entry.parsed.id as string);
 					}
 				} else {
-					tokenCount += current.line.length / 8;
+					// Walk parentId chain backwards using exact token costs
+					let tokenCount = 0;
+					while (current?.parsed.id) {
+						activeIds.add(current.parsed.id as string);
+						tokenCount += exactCosts.get(current.parsed.id as string) ?? current.line.length / 4;
+						if (tokenCount >= budget) break;
+						const parentId = current.parsed.parentId as string | undefined;
+						if (!parentId || parentId === current.parsed.id) break;
+						current = entryMap.get(parentId);
+					}
 				}
-
-				if (tokenCount >= budget) break;
-				const parentId = current.parsed.parentId as string | undefined;
-				if (!parentId || parentId === current.parsed.id) break;
-				current = entryMap.get(parentId);
+			} else {
+				// No budget limit — collect all entries
+				for (const entry of entries) {
+					if (entry.parsed.id) activeIds.add(entry.parsed.id as string);
+				}
 			}
 
 			// Write trimmed session with new header
@@ -823,7 +856,6 @@ async function createAnalysisSessionArgs(
 				cleanup: () => rm(sessionDir, { recursive: true, force: true }),
 			};
 		} catch {
-			// Trimming failed; fall back to no-session (isolated)
 			return {
 				args: ["--no-session"],
 				mode: "isolated",
@@ -847,6 +879,7 @@ async function analyzeWithPi({
 }: AnalyzeWithPiOptions): Promise<string> {
 	const analysisSession = await createAnalysisSessionArgs(session);
 	const promptWithAwareness = `${getAnalysisSessionAwarenessInstruction(analysisSession.mode)}\n\n${prompt}`;
+
 	try {
 		return await new Promise<string>((resolvePromise, reject) => {
 			const args = [
@@ -1162,13 +1195,19 @@ async function analyzeImageBatch(
 
 ${IMAGE_ANALYSIS_PROMPT}`;
 
-	return analyzeWithPi({
+	const text = await analyzeWithPi({
 		attachmentPaths: absolutePaths,
 		prompt,
 		backend: options.backend,
 		session: options.session,
 		signal: options.signal,
 	});
+
+	if (!text || text.trim().length === 0) {
+		throw new Error(`Image analysis returned empty result for ${absolutePaths.length} image(s).`);
+	}
+
+	return text;
 }
 
 async function analyzeVideoBatch(
