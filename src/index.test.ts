@@ -25,11 +25,28 @@ describe("analysis session awareness", () => {
 		const dir = await mkdtemp(join(tmpdir(), "pi-multi-modal-test-"));
 		try {
 			const sessionFile = join(dir, "source.jsonl");
-			await writeFile(sessionFile, "");
+			// Valid session with header and one message
+			await writeFile(
+				sessionFile,
+				JSON.stringify({ type: "session", version: 3, id: "test", timestamp: new Date().toISOString(), cwd: dir }) +
+					"\n" +
+					JSON.stringify({
+						type: "message",
+						id: "msg-1",
+						parentId: "test",
+						timestamp: new Date().toISOString(),
+						message: { role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() },
+					}) +
+					"\n",
+			);
 
-			const fork = await createAnalysisSessionArgsForTest({ mode: "fork", sourceSessionFile: sessionFile });
+			const fork = await createAnalysisSessionArgsForTest({
+				mode: "fork",
+				sourceSessionFile: sessionFile,
+				analysisModelContextWindow: 262_144,
+			});
 			expect(fork.mode).toBe("fork");
-			expect(fork.args).toEqual(["--fork", sessionFile, "--session-dir", expect.any(String)]);
+			expect(fork.args[0]).toBe("--session");
 			await fork.cleanup();
 
 			const fallback = await createAnalysisSessionArgsForTest({

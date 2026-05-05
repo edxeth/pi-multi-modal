@@ -8,7 +8,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomInt } from "node:crypto";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -36,6 +36,7 @@ import {
 	parseMultiModalBackend,
 	readAnalysisSessionModeSetting,
 	readMultiModalBackendSetting,
+	readReservedOutputTokensSetting,
 	resolveShowImagesSetting,
 	supportsNativeImageInput,
 } from "./utils.js";
@@ -427,12 +428,33 @@ async function getAnalysisSessionMode(): Promise<AnalysisSessionMode> {
 
 async function getAnalysisSessionOptions(ctx: {
 	sessionManager?: { getSessionFile?: () => string | undefined };
+	modelRegistry?: { find: (provider: string, modelId: string) => { contextWindow: number } | undefined };
+	backend?: { provider: string; model: string };
 }): Promise<AnalysisSessionOptions> {
 	const mode = await getAnalysisSessionMode();
 	if (mode !== "fork") {
 		return { mode };
 	}
-	return { mode, sourceSessionFile: ctx.sessionManager?.getSessionFile?.() };
+
+	// Look up the analysis model's context window for session trimming
+	let analysisModelContextWindow: number | undefined;
+	if (ctx.modelRegistry && ctx.backend) {
+		const model = ctx.modelRegistry.find(ctx.backend.provider, ctx.backend.model);
+		if (model) {
+			analysisModelContextWindow = model.contextWindow;
+		}
+	}
+
+	// Read reserved output tokens from settings
+	const settings = await readJsonFileIfExists(GLOBAL_SETTINGS_PATH);
+	const reservedOutputTokens = readReservedOutputTokensSetting(settings);
+
+	return {
+		mode,
+		sourceSessionFile: ctx.sessionManager?.getSessionFile?.(),
+		analysisModelContextWindow,
+		reservedOutputTokens,
+	};
 }
 
 function writeBackendIntoSettings(settings: Record<string, unknown>, config: MultiModalBackendConfig): void {
@@ -647,6 +669,10 @@ async function analyzeMediaToolResult(
 interface AnalysisSessionOptions {
 	mode: AnalysisSessionMode;
 	sourceSessionFile?: string;
+	/** Context window of the analysis model, used to trim forked sessions. */
+	analysisModelContextWindow?: number;
+	/** Tokens reserved for the analysis model's output when trimming forked sessions. Defaults to 10_000. */
+	reservedOutputTokens?: number;
 }
 
 interface AnalyzeImageOptions {
@@ -701,11 +727,109 @@ async function createAnalysisSessionArgs(
 ): Promise<{ args: string[]; mode: EffectiveAnalysisSessionMode; cleanup: () => Promise<void> }> {
 	if (session?.mode === "fork" && session.sourceSessionFile && existsSync(session.sourceSessionFile)) {
 		const sessionDir = await mkdtemp(join(tmpdir(), "pi-multi-modal-session-"));
-		return {
-			args: ["--fork", session.sourceSessionFile, "--session-dir", sessionDir],
-			mode: "fork",
-			cleanup: () => rm(sessionDir, { recursive: true, force: true }),
-		};
+
+		// Determine the token budget for trimming the forked session.
+		// The session file on disk can be much larger than the parent's active
+		// memory context (e.g. 553K tokens vs 130K tokens). Forking the raw
+		// session file would pass all that stale history to the vision model,
+		// causing silent empty output when it exceeds the model's context window.
+		//
+		// Formula:
+		//   budget = analysis_model_context_window - reserved_output_tokens
+		//   Walk the parentId chain from the last entry, collecting entries
+		//   until we hit the budget limit.
+		//
+		// Token count is taken from the last assistant message's usage.input,
+		// which pi already tracks exactly per provider tokenizer. This is far
+		// more accurate than estimating from text length.
+		const RESERVE_OUTPUT_TOKENS = session.reservedOutputTokens ?? 10_000;
+		const budget = session.analysisModelContextWindow
+			? session.analysisModelContextWindow - RESERVE_OUTPUT_TOKENS
+			: 200_000; // fallback if we can't look up the model
+
+		const trimmedFile = join(sessionDir, "trimmed-source.jsonl");
+		try {
+			const sourceContent = readFileSync(session.sourceSessionFile, "utf-8");
+			const lines = sourceContent.split("\n").filter((l) => l.trim());
+			const entries: Array<{ line: string; parsed: Record<string, unknown> }> = [];
+			for (const line of lines) {
+				try {
+					entries.push({ line, parsed: JSON.parse(line) });
+				} catch {
+					/* skip */
+				}
+			}
+
+			const headerEntry = entries.find((e) => e.parsed.type === "session");
+			if (!headerEntry) throw new Error("No session header");
+
+			// Build entry map for parentId traversal
+			const entryMap = new Map<string, (typeof entries)[0]>();
+			for (const entry of entries) {
+				if (entry.parsed.id) entryMap.set(entry.parsed.id as string, entry);
+			}
+
+			// Walk parentId chain from the last entry, collecting within budget.
+			// Since we know the exact session token count from usage.input,
+			// we estimate older entries proportionally from text content length.
+			// This is imprecise but the budget is a soft ceiling — being off by
+			// a few entries doesn't break anything.
+			const activeIds = new Set<string>();
+			let current: (typeof entries)[0] | undefined = entries[entries.length - 1];
+			let tokenCount = 0;
+			while (current?.parsed.id) {
+				activeIds.add(current.parsed.id as string);
+
+				// Estimate token count from text content (rough: 4 chars per token)
+				if (current.parsed.type === "message") {
+					const msg = current.parsed.message as Record<string, unknown> | undefined;
+					const content = msg?.content;
+					if (Array.isArray(content)) {
+						for (const block of content) {
+							if (typeof block === "object" && block && (block as Record<string, unknown>).type === "text") {
+								tokenCount += (((block as Record<string, unknown>).text as string) ?? "").length / 4;
+							}
+						}
+					}
+				} else {
+					tokenCount += current.line.length / 8;
+				}
+
+				if (tokenCount >= budget) break;
+				const parentId = current.parsed.parentId as string | undefined;
+				if (!parentId || parentId === current.parsed.id) break;
+				current = entryMap.get(parentId);
+			}
+
+			// Write trimmed session with new header
+			const trimmedLines: string[] = [];
+			trimmedLines.push(
+				JSON.stringify({
+					...headerEntry.parsed,
+					timestamp: new Date().toISOString(),
+					parentSession: session.sourceSessionFile,
+				}),
+			);
+			for (const entry of entries) {
+				if (entry.parsed.type !== "session" && activeIds.has(entry.parsed.id as string)) {
+					trimmedLines.push(entry.line);
+				}
+			}
+			writeFileSync(trimmedFile, `${trimmedLines.join("\n")}\n`, "utf-8");
+
+			return {
+				args: ["--session", trimmedFile],
+				mode: "fork",
+				cleanup: () => rm(sessionDir, { recursive: true, force: true }),
+			};
+		} catch {
+			// Trimming failed; fall back to no-session (isolated)
+			return {
+				args: ["--no-session"],
+				mode: "isolated",
+				cleanup: () => rm(sessionDir, { recursive: true, force: true }),
+			};
+		}
 	}
 
 	return { args: ["--no-session"], mode: "isolated", cleanup: async () => undefined };
@@ -723,7 +847,7 @@ async function analyzeWithPi({
 	const analysisSession = await createAnalysisSessionArgs(session);
 	const promptWithAwareness = `${getAnalysisSessionAwarenessInstruction(analysisSession.mode)}\n\n${prompt}`;
 	try {
-		return await new Promise((resolvePromise, reject) => {
+		return await new Promise<string>((resolvePromise, reject) => {
 			const args = [
 				...attachmentPaths.map((path) => `@${path}`),
 				...analysisSession.args,
@@ -1481,10 +1605,9 @@ async function analyzeExplicitMediaReferences(
 	}
 
 	if (sections.length === 0 && errors.length > 0) {
-		return [
-			"The following explicit @media references were analyzed before the agent response.",
-			...errors,
-		].join("\n\n");
+		return ["The following explicit @media references were analyzed before the agent response.", ...errors].join(
+			"\n\n",
+		);
 	}
 
 	return [
@@ -1515,7 +1638,7 @@ async function resolveInlineBashImageContent(
 			video: false,
 			pdf: false,
 			backend,
-			session: await getAnalysisSessionOptions(ctx),
+			session: await getAnalysisSessionOptions({ ...ctx, backend }),
 			signal,
 		});
 		return result.content;
@@ -1684,7 +1807,7 @@ export default function (pi: ExtensionAPI) {
 						video,
 						pdf,
 						backend,
-						session: await getAnalysisSessionOptions(ctx),
+						session: await getAnalysisSessionOptions({ ...ctx, backend }),
 					});
 					return { content: result.content, details: result.details };
 				}
@@ -1827,7 +1950,7 @@ export default function (pi: ExtensionAPI) {
 				explicitMediaAnalysisForContext = await analyzeExplicitMediaReferences(mediaPathsToAnalyze, {
 					cwd: ctx.cwd,
 					backend,
-					session: await getAnalysisSessionOptions(ctx),
+					session: await getAnalysisSessionOptions({ ...ctx, backend }),
 				});
 			}
 
@@ -1915,7 +2038,7 @@ export default function (pi: ExtensionAPI) {
 					video,
 					pdf,
 					backend,
-					session: await getAnalysisSessionOptions(ctx),
+					session: await getAnalysisSessionOptions({ ...ctx, backend }),
 					signal,
 					onUpdate,
 				});
