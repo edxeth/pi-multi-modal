@@ -1,24 +1,24 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createAnalysisSessionArgsForTest, getAnalysisSessionAwarenessInstruction } from "../src/index.js";
 
 describe("analysis session awareness", () => {
-	it("describes isolated analysis as having no prior conversation", () => {
+	it("keeps isolated analysis prompt free of prior-context assumptions", () => {
 		const instruction = getAnalysisSessionAwarenessInstruction("isolated");
 
-		expect(instruction).toContain("without access to the prior conversation");
-		expect(instruction).toContain("Do not assume unstated context");
 		expect(instruction).toContain("attached media");
+		expect(instruction).toContain("Do not assume earlier chat context");
 	});
 
-	it("describes forked analysis as having current conversation context", () => {
+	it("keeps forked analysis prompt short and history-aware without Pi internals", () => {
 		const instruction = getAnalysisSessionAwarenessInstruction("fork");
 
-		expect(instruction).toContain("temporary fork of the current Pi conversation");
-		expect(instruction).toContain("prior conversation context");
-		expect(instruction).toContain("ground every visual, video, or document claim");
+		expect(instruction).toContain("previous conversation");
+		expect(instruction).toContain("attached media");
+		expect(instruction).not.toContain("fork");
+		expect(instruction).not.toContain("Pi");
 	});
 
 	it("uses fork args only when a source session file exists", async () => {
@@ -56,6 +56,73 @@ describe("analysis session awareness", () => {
 			expect(fallback.mode).toBe("isolated");
 			expect(fallback.args).toEqual(["--no-session"]);
 			await fallback.cleanup();
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("drops the current user media turn and stale usage from forked analysis sessions", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-multi-modal-test-"));
+		try {
+			const sessionFile = join(dir, "source.jsonl");
+			await writeFile(
+				sessionFile,
+				`${[
+					JSON.stringify({
+						type: "session",
+						version: 3,
+						id: "session-1",
+						timestamp: new Date().toISOString(),
+						cwd: dir,
+					}),
+					JSON.stringify({ type: "model_change", id: "model-1", parentId: "session-1" }),
+					JSON.stringify({
+						type: "message",
+						id: "user-1",
+						parentId: "model-1",
+						message: { role: "user", content: [{ type: "text", text: "prior question" }] },
+					}),
+					JSON.stringify({
+						type: "message",
+						id: "assistant-1",
+						parentId: "user-1",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "prior answer" }],
+							usage: { input: 100, cacheRead: 200, totalTokens: 350 },
+						},
+					}),
+					JSON.stringify({
+						type: "message",
+						id: "current-user-image",
+						parentId: "assistant-1",
+						message: {
+							role: "user",
+							content: [
+								{ type: "text", text: '<file name="/tmp/current.png"></file> describe this' },
+								{ type: "image", mimeType: "image/png", data: "base64-image-data" },
+							],
+						},
+					}),
+				].join("\n")}\n`,
+			);
+
+			const fork = await createAnalysisSessionArgsForTest({
+				mode: "fork",
+				sourceSessionFile: sessionFile,
+				analysisModelContextWindow: 262_144,
+			});
+
+			const trimmed = await readFile(fork.args[1], "utf-8");
+			expect(trimmed).toContain("prior question");
+			expect(trimmed).toContain("prior answer");
+			expect(trimmed).not.toContain("current-user-image");
+			expect(trimmed).not.toContain("base64-image-data");
+			expect(trimmed).not.toContain('"totalTokens":350');
+			expect(trimmed).not.toContain('"cacheRead":200');
+			expect(trimmed).toContain('"totalTokens":0');
+			expect(trimmed).toContain('"cacheRead":0');
+			await fork.cleanup();
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}

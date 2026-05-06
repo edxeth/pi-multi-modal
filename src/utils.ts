@@ -228,7 +228,30 @@ export function findInlineImagePaths(text: string): string[] {
 }
 
 /**
+ * Regex to match pi's internal <file name="..."> tags.
+ * Pi converts @-prefixed paths to this format before on("input") fires.
+ */
+const FILE_TAG_REGEX = /<file\s+name="([^"]+)"[^>]*><\/file>/gi;
+
+/**
+ * Extract media paths from <file name="..."> tags.
+ * Pi converts @path to this format before on("input") fires.
+ */
+export function findMediaPathsFromFileTags(text: string): string[] {
+	const matches: string[] = [];
+	for (const match of text.matchAll(FILE_TAG_REGEX)) {
+		const path = match[1];
+		if (path && isMediaFile(path)) {
+			matches.push(path);
+		}
+	}
+	return matches;
+}
+
+/**
  * Find explicit @-prefixed media paths that should opt into vision analysis.
+ * Also checks for pi's <file name="..."> tag format, since pi converts
+ * @path to <file> before on("input") fires.
  */
 export function findExplicitMediaPaths(text: string): string[] {
 	const matches: string[] = [];
@@ -238,13 +261,31 @@ export function findExplicitMediaPaths(text: string): string[] {
 			matches.push(path);
 		}
 	}
+	// Also extract from <file> tags (pi converts @path to this format)
+	for (const path of findMediaPathsFromFileTags(text)) {
+		if (!matches.includes(path)) {
+			matches.push(path);
+		}
+	}
 	return matches;
 }
 
 export function findExplicitImagePaths(text: string): string[] {
-	return findImageReferences(text)
+	const atPaths = findImageReferences(text)
 		.filter((match) => match.fullMatch.slice(match.prefix.length).startsWith("@"))
 		.map((match) => match.path);
+	// Also extract image paths from <file> tags
+	const fileTagPaths = findMediaPathsFromFileTags(text).filter((p) => isImageFile(p));
+	// Merge, deduplicate, preserve order
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const path of [...atPaths, ...fileTagPaths]) {
+		if (!seen.has(path)) {
+			seen.add(path);
+			result.push(path);
+		}
+	}
+	return result;
 }
 
 export function findImageReferences(text: string): ImageReferenceMatch[] {

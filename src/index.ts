@@ -51,8 +51,8 @@ function createClipboardImageId(length = 8): string {
 	return id;
 }
 
-// Embedded analysis prompt for the configured media backend
-const IMAGE_ANALYSIS_PROMPT = `You are analyzing an image. Follow these steps:
+// Embedded analysis prompts for the configured media backend
+const ISOLATED_IMAGE_ANALYSIS_PROMPT = `You are analyzing an image. Follow these steps:
 
 ## Step 1: Classify
 
@@ -122,6 +122,13 @@ Always start your response with:
 **Category**: [category-name]
 
 Then provide your detailed analysis using the appropriate template above.`;
+
+const FORKED_IMAGE_ANALYSIS_PROMPT = `Analyze the attached image for the current conversation.
+
+Return only concise markdown:
+- **Category**: ui-screenshot | code-screenshot | error-screenshot | diagram | chart | general
+- **Summary**: one sentence
+- **Details**: 3-5 bullets with only the facts most relevant to the user's current request`;
 
 const VIDEO_ANALYSIS_PROMPT = `You are analyzing a video represented as chronological keyframes.
 
@@ -698,7 +705,7 @@ interface AnalyzePdfOptions {
 
 interface AnalyzeWithPiOptions {
 	attachmentPaths: string[];
-	prompt: string;
+	prompt: string | ((mode: EffectiveAnalysisSessionMode) => string);
 	backend: MultiModalBackendConfig;
 	session?: AnalysisSessionOptions;
 	signal?: AbortSignal;
@@ -708,61 +715,100 @@ type EffectiveAnalysisSessionMode = "isolated" | "fork";
 
 export function getAnalysisSessionAwarenessInstruction(mode: EffectiveAnalysisSessionMode): string {
 	if (mode === "fork") {
-		return [
-			"Conversation awareness: you are analyzing attached media inside a temporary fork of the current Pi conversation.",
-			"You may use available prior conversation context to interpret the user's intent, but ground every visual, video, or document claim in the attached media.",
-			"If the conversation context and the media conflict, say so explicitly instead of inventing missing evidence.",
-		].join(" ");
+		return "Use the previous conversation to understand the user's intent. Describe only what is visible in the attached media.";
 	}
 
-	return [
-		"Conversation awareness: you are analyzing attached media without access to the prior conversation.",
-		"Do not assume unstated context from earlier chat turns; use only the attached media and this analysis prompt.",
-		"Ground every visual, video, or document claim in the attached media.",
-	].join(" ");
+	return "You only have the attached media and this prompt. Do not assume earlier chat context.";
 }
 
-/** Find the last assistant message's exact token count from usage.input. */
-function getLastAssistantInput(entries: Array<{ line: string; parsed: Record<string, unknown> }>): number | undefined {
+function imageAnalysisPrompt(mode: EffectiveAnalysisSessionMode, imageCount: number): string {
+	const base = mode === "fork" ? FORKED_IMAGE_ANALYSIS_PROMPT : ISOLATED_IMAGE_ANALYSIS_PROMPT;
+	if (imageCount <= 1) return base;
+	return `Analyze ${imageCount} attached images together for the current request. Return one concise section per image.\n\n${base}`;
+}
+
+/**
+ * Return the cumulative input tokens for an assistant usage record.
+ * The sum input + cacheRead is the true cumulative context size.
+ */
+function getCumulativeInputTokens(usage: Record<string, unknown>): number {
+	const input = typeof usage.input === "number" ? usage.input : 0;
+	const cacheRead = typeof usage.cacheRead === "number" ? usage.cacheRead : 0;
+	return input + cacheRead;
+}
+
+/**
+ * Find the last assistant message's cumulative input tokens.
+ */
+function getLastAssistantCumulative(
+	entries: Array<{ line: string; parsed: Record<string, unknown> }>,
+): number | undefined {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry.parsed.type !== "message") continue;
 		const msg = entry.parsed.message as Record<string, unknown> | undefined;
 		if (msg?.role !== "assistant") continue;
 		const usage = msg.usage as Record<string, unknown> | undefined;
-		const input = usage?.input;
-		if (typeof input === "number") return input;
+		if (!usage) continue;
+		return getCumulativeInputTokens(usage);
 	}
 	return undefined;
 }
 
-/** Build exact token costs per entry by diffing consecutive assistant usage.input values. */
-function buildExactTokenCosts(entries: Array<{ line: string; parsed: Record<string, unknown> }>): Map<string, number> {
-	const costs = new Map<string, number>();
-	let previousInput = 0;
+/**
+ * Serialize a session entry, resetting stale usage metadata from assistant messages.
+ * Pi expects assistant messages to have usage.totalTokens, but stale parent
+ * totals can trigger false context compaction in the child.
+ */
+function trace(label: string, data: Record<string, unknown> = {}) {
+	if (process.env.PI_MULTI_MODAL_TRACE !== "1") return;
+	const suffix = Object.keys(data).length > 0 ? ` ${JSON.stringify(data)}` : "";
+	console.error(`[pi-multi-modal trace] ${label}${suffix}`);
+}
 
-	for (const entry of entries) {
-		const id = entry.parsed.id as string | undefined;
-		if (!id) continue;
+function serializeEntry(entry: { line: string; parsed: Record<string, unknown> }): string {
+	if (entry.parsed.type !== "message") return entry.line;
+	const msg = entry.parsed.message as Record<string, unknown> | undefined;
+	if (!msg || msg.role !== "assistant") return entry.line;
+	if (!msg.usage) return entry.line;
 
-		if (entry.parsed.type === "message") {
-			const msg = entry.parsed.message as Record<string, unknown> | undefined;
-			if (msg?.role === "assistant") {
-				const usage = msg.usage as Record<string, unknown> | undefined;
-				const input = usage?.input;
-				if (typeof input === "number") {
-					const cost = input - previousInput;
-					costs.set(id, cost > 0 ? cost : 0);
-					previousInput = input;
-					continue;
-				}
-			}
+	const parsedClone = structuredClone(entry.parsed);
+	const clonedMsg = parsedClone.message as Record<string, unknown>;
+	clonedMsg.usage = {
+		input: 0,
+		output: 0,
+		cacheCreation: 0,
+		cacheRead: 0,
+		totalTokens: 0,
+	};
+	return JSON.stringify(parsedClone);
+}
+
+/**
+ * Keep only completed prior conversation for forked analysis sessions.
+ * During a context hook, the source session may already contain the current
+ * user message with embedded image data. The analysis child also receives the
+ * media as @attachments, so including the current user turn duplicates large
+ * image payloads and can make analysis very slow.
+ */
+function completedConversationEntries(entries: Array<{ line: string; parsed: Record<string, unknown> }>) {
+	let lastAssistantIndex = -1;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.parsed.type !== "message") continue;
+		const msg = entry.parsed.message as Record<string, unknown> | undefined;
+		if (msg?.role === "assistant") {
+			lastAssistantIndex = i;
+			break;
 		}
-		// Fallback: rough estimate for non-assistant entries
-		costs.set(id, entry.line.length / 4);
 	}
 
-	return costs;
+	if (lastAssistantIndex >= 0) {
+		return entries.slice(0, lastAssistantIndex + 1);
+	}
+
+	// No completed assistant turn yet; keep only session metadata.
+	return entries.filter((entry) => entry.parsed.type !== "message" && entry.parsed.type !== "toolResult");
 }
 
 async function createAnalysisSessionArgs(
@@ -778,6 +824,7 @@ async function createAnalysisSessionArgs(
 
 		const trimmedFile = join(sessionDir, "trimmed-source.jsonl");
 		try {
+			const started = Date.now();
 			const sourceContent = readFileSync(session.sourceSessionFile, "utf-8");
 			const lines = sourceContent.split("\n").filter((l) => l.trim());
 			const entries: Array<{ line: string; parsed: Record<string, unknown> }> = [];
@@ -791,50 +838,68 @@ async function createAnalysisSessionArgs(
 
 			const headerEntry = entries.find((e) => e.parsed.type === "session");
 			if (!headerEntry) throw new Error("No session header");
+			const completedEntries = completedConversationEntries(entries);
+			trace("fork session parsed", {
+				entries: entries.length,
+				completedEntries: completedEntries.length,
+				droppedEntries: entries.length - completedEntries.length,
+				sourceBytes: sourceContent.length,
+			});
 
-			const entryMap = new Map<string, (typeof entries)[0]>();
-			for (const entry of entries) {
-				if (entry.parsed.id) entryMap.set(entry.parsed.id as string, entry);
+			// Negative budget safeguard: if budget <= 0, nothing can fit
+			if (budget !== undefined && budget <= 0) {
+				writeFileSync(
+					trimmedFile,
+					`${JSON.stringify({
+						...headerEntry.parsed,
+						timestamp: new Date().toISOString(),
+						parentSession: session.sourceSessionFile,
+					})}\n`,
+					"utf-8",
+				);
+				return {
+					args: ["--session", trimmedFile],
+					mode: "fork",
+					cleanup: () => rm(sessionDir, { recursive: true, force: true }),
+				};
 			}
 
-			// Build exact token costs per entry by walking forward and computing
-			// differences between consecutive assistant messages' usage.input.
-			// Non-assistant entries get estimated from line length.
-			const exactCosts = buildExactTokenCosts(entries);
+			// Compute total cumulative context from the last assistant message.
+			// We use input + cacheRead, which is the true cumulative context size.
+			const lastCumulative = getLastAssistantCumulative(completedEntries);
 
-			const activeIds = new Set<string>();
-			let current: (typeof entries)[0] | undefined = entries[entries.length - 1];
+			// Determine which entries to keep
+			let firstKeptIndex = 0;
 
-			// Check if the session already fits within budget using the exact token
-			// count from the last assistant message (pi tracks this in usage.input).
-			// If it fits, collect everything — no estimation needed.
-			if (budget !== undefined) {
-				const lastAssistantInput = getLastAssistantInput(entries);
-				if (lastAssistantInput !== undefined && lastAssistantInput < budget) {
-					// Collect all entries — the whole session fits within budget
-					for (const entry of entries) {
-						if (entry.parsed.id) activeIds.add(entry.parsed.id as string);
+			if (budget !== undefined && lastCumulative !== undefined && lastCumulative > budget) {
+				// Session doesn't fit — find cut point via forward scan.
+				// overflow = how much context we need to trim from the beginning
+				const overflow = lastCumulative - budget;
+				let prevAssistantCumulative = 0;
+				let prevAssistantIndex = -1;
+
+				for (let i = 0; i < completedEntries.length; i++) {
+					const entry = completedEntries[i];
+					if (entry.parsed.type !== "message") continue;
+					const msg = entry.parsed.message as Record<string, unknown> | undefined;
+					if (msg?.role !== "assistant") continue;
+					const usage = msg.usage as Record<string, unknown> | undefined;
+					if (!usage) continue;
+
+					// cumulativeBefore = cumulative context BEFORE this assistant turn
+					if (prevAssistantCumulative >= overflow) {
+						// Suffix from here onward fits within budget
+						firstKeptIndex = prevAssistantIndex + 1;
+						break;
 					}
-				} else {
-					// Walk parentId chain backwards using exact token costs
-					let tokenCount = 0;
-					while (current?.parsed.id) {
-						activeIds.add(current.parsed.id as string);
-						tokenCount += exactCosts.get(current.parsed.id as string) ?? current.line.length / 4;
-						if (tokenCount >= budget) break;
-						const parentId = current.parsed.parentId as string | undefined;
-						if (!parentId || parentId === current.parsed.id) break;
-						current = entryMap.get(parentId);
-					}
+					prevAssistantCumulative = getCumulativeInputTokens(usage);
+					prevAssistantIndex = i;
 				}
-			} else {
-				// No budget limit — collect all entries
-				for (const entry of entries) {
-					if (entry.parsed.id) activeIds.add(entry.parsed.id as string);
-				}
+				// If we never found a cut point (shouldn't happen for overflow > 0),
+				// firstKeptIndex stays 0 and we keep everything after the header.
 			}
 
-			// Write trimmed session with new header
+			// Write trimmed session with new header + stripped usage + kept suffix
 			const trimmedLines: string[] = [];
 			trimmedLines.push(
 				JSON.stringify({
@@ -843,19 +908,27 @@ async function createAnalysisSessionArgs(
 					parentSession: session.sourceSessionFile,
 				}),
 			);
-			for (const entry of entries) {
-				if (entry.parsed.type !== "session" && activeIds.has(entry.parsed.id as string)) {
-					trimmedLines.push(entry.line);
+			for (let i = firstKeptIndex; i < completedEntries.length; i++) {
+				const entry = completedEntries[i];
+				if (entry.parsed.type !== "session") {
+					trimmedLines.push(serializeEntry(entry));
 				}
 			}
-			writeFileSync(trimmedFile, `${trimmedLines.join("\n")}\n`, "utf-8");
+			const trimmedContent = `${trimmedLines.join("\n")}\n`;
+			writeFileSync(trimmedFile, trimmedContent, "utf-8");
+			trace("fork session written", {
+				trimmedBytes: trimmedContent.length,
+				trimmedLines: trimmedLines.length,
+				durationMs: Date.now() - started,
+			});
 
 			return {
 				args: ["--session", trimmedFile],
 				mode: "fork",
 				cleanup: () => rm(sessionDir, { recursive: true, force: true }),
 			};
-		} catch {
+		} catch (error) {
+			trace("fork session fallback", { error: error instanceof Error ? error.message : String(error) });
 			return {
 				args: ["--no-session"],
 				mode: "isolated",
@@ -877,8 +950,10 @@ async function analyzeWithPi({
 	session,
 	signal,
 }: AnalyzeWithPiOptions): Promise<string> {
+	const setupStarted = Date.now();
 	const analysisSession = await createAnalysisSessionArgs(session);
-	const promptWithAwareness = `${getAnalysisSessionAwarenessInstruction(analysisSession.mode)}\n\n${prompt}`;
+	const resolvedPrompt = typeof prompt === "function" ? prompt(analysisSession.mode) : prompt;
+	const promptWithAwareness = `${getAnalysisSessionAwarenessInstruction(analysisSession.mode)}\n\n${resolvedPrompt}`;
 
 	try {
 		return await new Promise<string>((resolvePromise, reject) => {
@@ -901,6 +976,14 @@ async function analyzeWithPi({
 			const childEnv = { ...process.env };
 			delete childEnv.PI_PACKAGE_DIR;
 
+			trace("analysis child spawn", {
+				backend: `${backend.provider}/${backend.model}${backend.thinkingLevel ? `:${backend.thinkingLevel}` : ""}`,
+				attachments: attachmentPaths.length,
+				sessionMode: analysisSession.mode,
+				setupMs: Date.now() - setupStarted,
+			});
+			const childStarted = Date.now();
+
 			const child = spawn("pi", args, {
 				stdio: ["ignore", "pipe", "pipe"],
 				env: childEnv,
@@ -922,6 +1005,13 @@ async function analyzeWithPi({
 			});
 
 			child.on("close", (code: number | null) => {
+				trace("analysis child close", {
+					code,
+					durationMs: Date.now() - childStarted,
+					stdoutBytes: stdout.length,
+					stderrBytes: stderr.length,
+					...(code !== 0 ? { stderr: stderr.slice(0, 500) } : {}),
+				});
 				if (code !== 0) {
 					reject(new Error(`pi subprocess failed (${code}): ${stderr}`));
 					return;
@@ -957,7 +1047,7 @@ async function analyzeWithPi({
 async function analyzeImage({ absolutePath, backend, session, signal }: AnalyzeImageOptions): Promise<string> {
 	return analyzeWithPi({
 		attachmentPaths: [absolutePath],
-		prompt: IMAGE_ANALYSIS_PROMPT,
+		prompt: (mode) => imageAnalysisPrompt(mode, 1),
 		backend,
 		session,
 		signal,
@@ -1188,16 +1278,9 @@ async function analyzeImageBatch(
 		signal?: AbortSignal;
 	},
 ): Promise<string> {
-	const prompt =
-		absolutePaths.length === 1
-			? IMAGE_ANALYSIS_PROMPT
-			: `You are analyzing ${absolutePaths.length} images. For each image, provide separate analysis using the template below. Clearly separate each image's analysis.
-
-${IMAGE_ANALYSIS_PROMPT}`;
-
 	const text = await analyzeWithPi({
 		attachmentPaths: absolutePaths,
-		prompt,
+		prompt: (mode) => imageAnalysisPrompt(mode, absolutePaths.length),
 		backend: options.backend,
 		session: options.session,
 		signal: options.signal,
@@ -1903,10 +1986,19 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("input", async (event, ctx) => {
+		const inputStarted = Date.now();
+		// Detect media paths from both @-prefixed paths and <file name="..."> tags.
+		// Pi converts @path to <file> before on("input") fires, so we need both.
 		const explicitMediaPaths = findExplicitMediaPaths(event.text);
 		explicitMediaPathsForContext = explicitMediaPaths;
 		explicitMediaAnalysisForContext = undefined;
 		explicitMediaAnalysisPaths = new Set(explicitMediaPaths.map((path) => resolveUserPath(ctx.cwd, path)));
+		trace("input media detected", {
+			paths: explicitMediaPaths.length,
+			images: event.images?.length ?? 0,
+			supportsNativeImages: supportsNativeImageInput(ctx.model?.input),
+			durationMs: Date.now() - inputStarted,
+		});
 		if (ctx.hasUI) {
 			attachmentIndicatorController.reset(ctx as AttachmentIndicatorCtx);
 		}
@@ -1915,11 +2007,10 @@ export default function (pi: ExtensionAPI) {
 			return { action: "continue" };
 		}
 
+		// For vision models: collect image paths from both @path and <file> tags
 		const explicitImagePaths = findExplicitImagePaths(event.text);
-		if (explicitImagePaths.length === 0) {
-			return { action: "continue" };
-		}
 
+		// If event.images has content but no paths found, try saving them to temp
 		const attachments = [...(event.images ?? [])];
 		let changed = false;
 
@@ -1933,7 +2024,7 @@ export default function (pi: ExtensionAPI) {
 			changed = true;
 		}
 
-		if (!changed) {
+		if (!changed && attachments.length === (event.images ?? []).length) {
 			return { action: "continue" };
 		}
 
@@ -1969,6 +2060,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("context", async (event, ctx) => {
+		const contextStarted = Date.now();
 		const messages = structuredClone(event.messages).filter(
 			(message) => message.role !== "custom" || message.customType !== REFERENCED_IMAGES_MESSAGE_TYPE,
 		);
@@ -1981,16 +2073,27 @@ export default function (pi: ExtensionAPI) {
 				})
 			: explicitMediaPathsForContext;
 
+		trace("context media check", {
+			candidatePaths: explicitMediaPathsForContext.length,
+			analyzePaths: mediaPathsToAnalyze.length,
+			supportsNativeImages: supportsImages,
+		});
+
 		if (mediaPathsToAnalyze.length > 0) {
 			if (!explicitMediaAnalysisForContext) {
 				if (ctx.hasUI) {
 					ctx.ui.notify(`Analyzing ${mediaPathsToAnalyze.length} explicit @media reference(s)...`, "info");
 				}
 				const backend = await getMultiModalBackend();
+				const analysisStarted = Date.now();
 				explicitMediaAnalysisForContext = await analyzeExplicitMediaReferences(mediaPathsToAnalyze, {
 					cwd: ctx.cwd,
 					backend,
 					session: await getAnalysisSessionOptions({ ...ctx, backend }),
+				});
+				trace("context analysis complete", {
+					durationMs: Date.now() - analysisStarted,
+					analysisBytes: explicitMediaAnalysisForContext.length,
 				});
 			}
 
@@ -2020,6 +2123,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (!supportsImages) {
+			trace("context complete", { changed, durationMs: Date.now() - contextStarted });
 			return changed ? { messages } : undefined;
 		}
 
