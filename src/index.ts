@@ -737,6 +737,10 @@ function getCumulativeInputTokens(usage: Record<string, unknown>): number {
 	return input + cacheRead;
 }
 
+function isValidCumulativeUsage(usage: Record<string, unknown>): boolean {
+	return getCumulativeInputTokens(usage) > 0;
+}
+
 /**
  * Find the last assistant message's cumulative input tokens.
  */
@@ -749,7 +753,7 @@ function getLastAssistantCumulative(
 		const msg = entry.parsed.message as Record<string, unknown> | undefined;
 		if (msg?.role !== "assistant") continue;
 		const usage = msg.usage as Record<string, unknown> | undefined;
-		if (!usage) continue;
+		if (!usage || !isValidCumulativeUsage(usage)) continue;
 		return getCumulativeInputTokens(usage);
 	}
 	return undefined;
@@ -766,21 +770,40 @@ function trace(label: string, data: Record<string, unknown> = {}) {
 	console.error(`[pi-multi-modal trace] ${label}${suffix}`);
 }
 
+function sanitizeMessageContent(content: unknown): unknown {
+	if (!Array.isArray(content)) return content;
+	return content.filter((block) => {
+		if (!(typeof block === "object" && block !== null)) return true;
+		const type = (block as Record<string, unknown>).type;
+		return type !== "image" && type !== "toolCall" && type !== "toolResult";
+	});
+}
+
+function isToolResultMessage(entry: { parsed: Record<string, unknown> }): boolean {
+	if (entry.parsed.type !== "message") return false;
+	const msg = entry.parsed.message as Record<string, unknown> | undefined;
+	return msg?.role === "toolResult" || msg?.role === "tool";
+}
+
 function serializeEntry(entry: { line: string; parsed: Record<string, unknown> }): string {
 	if (entry.parsed.type !== "message") return entry.line;
 	const msg = entry.parsed.message as Record<string, unknown> | undefined;
-	if (!msg || msg.role !== "assistant") return entry.line;
-	if (!msg.usage) return entry.line;
+	if (!msg) return entry.line;
 
 	const parsedClone = structuredClone(entry.parsed);
 	const clonedMsg = parsedClone.message as Record<string, unknown>;
-	clonedMsg.usage = {
-		input: 0,
-		output: 0,
-		cacheCreation: 0,
-		cacheRead: 0,
-		totalTokens: 0,
-	};
+	clonedMsg.content = sanitizeMessageContent(clonedMsg.content);
+
+	if (clonedMsg.role === "assistant" && clonedMsg.usage) {
+		clonedMsg.usage = {
+			input: 0,
+			output: 0,
+			cacheCreation: 0,
+			cacheRead: 0,
+			totalTokens: 0,
+		};
+	}
+
 	return JSON.stringify(parsedClone);
 }
 
@@ -875,28 +898,21 @@ async function createAnalysisSessionArgs(
 				// Session doesn't fit — find cut point via forward scan.
 				// overflow = how much context we need to trim from the beginning
 				const overflow = lastCumulative - budget;
-				let prevAssistantCumulative = 0;
-				let prevAssistantIndex = -1;
-
 				for (let i = 0; i < completedEntries.length; i++) {
 					const entry = completedEntries[i];
 					if (entry.parsed.type !== "message") continue;
 					const msg = entry.parsed.message as Record<string, unknown> | undefined;
 					if (msg?.role !== "assistant") continue;
 					const usage = msg.usage as Record<string, unknown> | undefined;
-					if (!usage) continue;
+					if (!usage || !isValidCumulativeUsage(usage)) continue;
 
-					// cumulativeBefore = cumulative context BEFORE this assistant turn
-					if (prevAssistantCumulative >= overflow) {
-						// Suffix from here onward fits within budget
-						firstKeptIndex = prevAssistantIndex + 1;
+					const currentCumulative = getCumulativeInputTokens(usage);
+					if (currentCumulative >= overflow) {
+						// Drop through this assistant turn. The remaining suffix fits the child budget.
+						firstKeptIndex = i + 1;
 						break;
 					}
-					prevAssistantCumulative = getCumulativeInputTokens(usage);
-					prevAssistantIndex = i;
 				}
-				// If we never found a cut point (shouldn't happen for overflow > 0),
-				// firstKeptIndex stays 0 and we keep everything after the header.
 			}
 
 			// Write trimmed session with new header + stripped usage + kept suffix
@@ -910,7 +926,7 @@ async function createAnalysisSessionArgs(
 			);
 			for (let i = firstKeptIndex; i < completedEntries.length; i++) {
 				const entry = completedEntries[i];
-				if (entry.parsed.type !== "session") {
+				if (entry.parsed.type !== "session" && !isToolResultMessage(entry)) {
 					trimmedLines.push(serializeEntry(entry));
 				}
 			}
