@@ -12,10 +12,10 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import type { ImageContent } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { BorderedLoader, createBashTool, createReadTool, getAgentDir } from "@mariozechner/pi-coding-agent";
-import { type Component, Container, Image, Spacer, Text } from "@mariozechner/pi-tui";
+import type { ImageContent } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, createBashTool, createReadTool, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type Component, Container, Image, Spacer, Text } from "@earendil-works/pi-tui";
 import { extensionForImageMimeType, readClipboardImage } from "./clipboard-image.js";
 import {
 	type AnalysisSessionMode,
