@@ -8,7 +8,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomInt } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -36,7 +36,6 @@ import {
 	parseMultiModalBackend,
 	readAnalysisSessionModeSetting,
 	readMultiModalBackendSetting,
-	readReservedOutputTokensSetting,
 	resolveShowImagesSetting,
 	supportsNativeImageInput,
 } from "./utils.js";
@@ -435,32 +434,11 @@ async function getAnalysisSessionMode(): Promise<AnalysisSessionMode> {
 
 async function getAnalysisSessionOptions(ctx: {
 	sessionManager?: { getSessionFile?: () => string | undefined };
-	modelRegistry?: { find: (provider: string, modelId: string) => { contextWindow: number } | undefined };
-	backend?: { provider: string; model: string };
 }): Promise<AnalysisSessionOptions> {
 	const mode = await getAnalysisSessionMode();
-	if (mode !== "fork") {
-		return { mode };
-	}
-
-	// Look up the analysis model's context window for session trimming
-	let analysisModelContextWindow: number | undefined;
-	if (ctx.modelRegistry && ctx.backend) {
-		const model = ctx.modelRegistry.find(ctx.backend.provider, ctx.backend.model);
-		if (model) {
-			analysisModelContextWindow = model.contextWindow;
-		}
-	}
-
-	// Read reserved output tokens from settings
-	const settings = await readJsonFileIfExists(GLOBAL_SETTINGS_PATH);
-	const reservedOutputTokens = readReservedOutputTokensSetting(settings);
-
 	return {
 		mode,
-		sourceSessionFile: ctx.sessionManager?.getSessionFile?.(),
-		analysisModelContextWindow,
-		reservedOutputTokens,
+		sourceSessionFile: mode === "fork" ? ctx.sessionManager?.getSessionFile?.() : undefined,
 	};
 }
 
@@ -676,10 +654,6 @@ async function analyzeMediaToolResult(
 interface AnalysisSessionOptions {
 	mode: AnalysisSessionMode;
 	sourceSessionFile?: string;
-	/** Context window of the analysis model, used to trim forked sessions. */
-	analysisModelContextWindow?: number;
-	/** Tokens reserved for the analysis model's output when trimming forked sessions. Defaults to 10_000. */
-	reservedOutputTokens?: number;
 }
 
 interface AnalyzeImageOptions {
@@ -727,230 +701,16 @@ function imageAnalysisPrompt(mode: EffectiveAnalysisSessionMode, imageCount: num
 	return `Analyze ${imageCount} attached images together for the current request. Return one concise section per image.\n\n${base}`;
 }
 
-/**
- * Return the cumulative input tokens for an assistant usage record.
- * The sum input + cacheRead is the true cumulative context size.
- */
-function getCumulativeInputTokens(usage: Record<string, unknown>): number {
-	const input = typeof usage.input === "number" ? usage.input : 0;
-	const cacheRead = typeof usage.cacheRead === "number" ? usage.cacheRead : 0;
-	return input + cacheRead;
-}
-
-function isValidCumulativeUsage(usage: Record<string, unknown>): boolean {
-	return getCumulativeInputTokens(usage) > 0;
-}
-
-/**
- * Find the last assistant message's cumulative input tokens.
- */
-function getLastAssistantCumulative(
-	entries: Array<{ line: string; parsed: Record<string, unknown> }>,
-): number | undefined {
-	for (let i = entries.length - 1; i >= 0; i--) {
-		const entry = entries[i];
-		if (entry.parsed.type !== "message") continue;
-		const msg = entry.parsed.message as Record<string, unknown> | undefined;
-		if (msg?.role !== "assistant") continue;
-		const usage = msg.usage as Record<string, unknown> | undefined;
-		if (!usage || !isValidCumulativeUsage(usage)) continue;
-		return getCumulativeInputTokens(usage);
-	}
-	return undefined;
-}
-
-/**
- * Serialize a session entry, resetting stale usage metadata from assistant messages.
- * Pi expects assistant messages to have usage.totalTokens, but stale parent
- * totals can trigger false context compaction in the child.
- */
-function trace(label: string, data: Record<string, unknown> = {}) {
-	if (process.env.PI_MULTI_MODAL_TRACE !== "1") return;
-	const suffix = Object.keys(data).length > 0 ? ` ${JSON.stringify(data)}` : "";
-	console.error(`[pi-multi-modal trace] ${label}${suffix}`);
-}
-
-function sanitizeMessageContent(content: unknown): unknown {
-	if (!Array.isArray(content)) return content;
-	return content.filter((block) => {
-		if (!(typeof block === "object" && block !== null)) return true;
-		const type = (block as Record<string, unknown>).type;
-		return type !== "image" && type !== "toolCall" && type !== "toolResult";
-	});
-}
-
-function isToolResultMessage(entry: { parsed: Record<string, unknown> }): boolean {
-	if (entry.parsed.type !== "message") return false;
-	const msg = entry.parsed.message as Record<string, unknown> | undefined;
-	return msg?.role === "toolResult" || msg?.role === "tool";
-}
-
-function serializeEntry(entry: { line: string; parsed: Record<string, unknown> }): string {
-	if (entry.parsed.type !== "message") return entry.line;
-	const msg = entry.parsed.message as Record<string, unknown> | undefined;
-	if (!msg) return entry.line;
-
-	const parsedClone = structuredClone(entry.parsed);
-	const clonedMsg = parsedClone.message as Record<string, unknown>;
-	clonedMsg.content = sanitizeMessageContent(clonedMsg.content);
-
-	if (clonedMsg.role === "assistant" && clonedMsg.usage) {
-		clonedMsg.usage = {
-			input: 0,
-			output: 0,
-			cacheCreation: 0,
-			cacheRead: 0,
-			totalTokens: 0,
-		};
-	}
-
-	return JSON.stringify(parsedClone);
-}
-
-/**
- * Keep only completed prior conversation for forked analysis sessions.
- * During a context hook, the source session may already contain the current
- * user message with embedded image data. The analysis child also receives the
- * media as @attachments, so including the current user turn duplicates large
- * image payloads and can make analysis very slow.
- */
-function completedConversationEntries(entries: Array<{ line: string; parsed: Record<string, unknown> }>) {
-	let lastAssistantIndex = -1;
-	for (let i = entries.length - 1; i >= 0; i--) {
-		const entry = entries[i];
-		if (entry.parsed.type !== "message") continue;
-		const msg = entry.parsed.message as Record<string, unknown> | undefined;
-		if (msg?.role === "assistant") {
-			lastAssistantIndex = i;
-			break;
-		}
-	}
-
-	if (lastAssistantIndex >= 0) {
-		return entries.slice(0, lastAssistantIndex + 1);
-	}
-
-	// No completed assistant turn yet; keep only session metadata.
-	return entries.filter((entry) => entry.parsed.type !== "message" && entry.parsed.type !== "toolResult");
-}
-
 async function createAnalysisSessionArgs(
 	session: AnalysisSessionOptions | undefined,
 ): Promise<{ args: string[]; mode: EffectiveAnalysisSessionMode; cleanup: () => Promise<void> }> {
 	if (session?.mode === "fork" && session.sourceSessionFile && existsSync(session.sourceSessionFile)) {
 		const sessionDir = await mkdtemp(join(tmpdir(), "pi-multi-modal-session-"));
-
-		const RESERVE_OUTPUT_TOKENS = session.reservedOutputTokens ?? 10_000;
-		const budget = session.analysisModelContextWindow
-			? session.analysisModelContextWindow - RESERVE_OUTPUT_TOKENS
-			: undefined;
-
-		const trimmedFile = join(sessionDir, "trimmed-source.jsonl");
-		try {
-			const started = Date.now();
-			const sourceContent = readFileSync(session.sourceSessionFile, "utf-8");
-			const lines = sourceContent.split("\n").filter((l) => l.trim());
-			const entries: Array<{ line: string; parsed: Record<string, unknown> }> = [];
-			for (const line of lines) {
-				try {
-					entries.push({ line, parsed: JSON.parse(line) });
-				} catch {
-					/* skip */
-				}
-			}
-
-			const headerEntry = entries.find((e) => e.parsed.type === "session");
-			if (!headerEntry) throw new Error("No session header");
-			const completedEntries = completedConversationEntries(entries);
-			trace("fork session parsed", {
-				entries: entries.length,
-				completedEntries: completedEntries.length,
-				droppedEntries: entries.length - completedEntries.length,
-				sourceBytes: sourceContent.length,
-			});
-
-			// Negative budget safeguard: if budget <= 0, nothing can fit
-			if (budget !== undefined && budget <= 0) {
-				writeFileSync(
-					trimmedFile,
-					`${JSON.stringify({
-						...headerEntry.parsed,
-						timestamp: new Date().toISOString(),
-						parentSession: session.sourceSessionFile,
-					})}\n`,
-					"utf-8",
-				);
-				return {
-					args: ["--session", trimmedFile],
-					mode: "fork",
-					cleanup: () => rm(sessionDir, { recursive: true, force: true }),
-				};
-			}
-
-			// Compute total cumulative context from the last assistant message.
-			// We use input + cacheRead, which is the true cumulative context size.
-			const lastCumulative = getLastAssistantCumulative(completedEntries);
-
-			// Determine which entries to keep
-			let firstKeptIndex = 0;
-
-			if (budget !== undefined && lastCumulative !== undefined && lastCumulative > budget) {
-				// Session doesn't fit — find cut point via forward scan.
-				// overflow = how much context we need to trim from the beginning
-				const overflow = lastCumulative - budget;
-				for (let i = 0; i < completedEntries.length; i++) {
-					const entry = completedEntries[i];
-					if (entry.parsed.type !== "message") continue;
-					const msg = entry.parsed.message as Record<string, unknown> | undefined;
-					if (msg?.role !== "assistant") continue;
-					const usage = msg.usage as Record<string, unknown> | undefined;
-					if (!usage || !isValidCumulativeUsage(usage)) continue;
-
-					const currentCumulative = getCumulativeInputTokens(usage);
-					if (currentCumulative >= overflow) {
-						// Drop through this assistant turn. The remaining suffix fits the child budget.
-						firstKeptIndex = i + 1;
-						break;
-					}
-				}
-			}
-
-			// Write trimmed session with new header + stripped usage + kept suffix
-			const trimmedLines: string[] = [];
-			trimmedLines.push(
-				JSON.stringify({
-					...headerEntry.parsed,
-					timestamp: new Date().toISOString(),
-					parentSession: session.sourceSessionFile,
-				}),
-			);
-			for (let i = firstKeptIndex; i < completedEntries.length; i++) {
-				const entry = completedEntries[i];
-				if (entry.parsed.type !== "session" && !isToolResultMessage(entry)) {
-					trimmedLines.push(serializeEntry(entry));
-				}
-			}
-			const trimmedContent = `${trimmedLines.join("\n")}\n`;
-			writeFileSync(trimmedFile, trimmedContent, "utf-8");
-			trace("fork session written", {
-				trimmedBytes: trimmedContent.length,
-				trimmedLines: trimmedLines.length,
-				durationMs: Date.now() - started,
-			});
-
-			return {
-				args: ["--session", trimmedFile],
-				mode: "fork",
-				cleanup: () => rm(sessionDir, { recursive: true, force: true }),
-			};
-		} catch (error) {
-			trace("fork session fallback", { error: error instanceof Error ? error.message : String(error) });
-			return {
-				args: ["--no-session"],
-				mode: "isolated",
-				cleanup: () => rm(sessionDir, { recursive: true, force: true }),
-			};
-		}
+		return {
+			args: ["--fork", session.sourceSessionFile, "--session-dir", sessionDir],
+			mode: "fork",
+			cleanup: () => rm(sessionDir, { recursive: true, force: true }),
+		};
 	}
 
 	return { args: ["--no-session"], mode: "isolated", cleanup: async () => undefined };
@@ -966,7 +726,6 @@ async function analyzeWithPi({
 	session,
 	signal,
 }: AnalyzeWithPiOptions): Promise<string> {
-	const setupStarted = Date.now();
 	const analysisSession = await createAnalysisSessionArgs(session);
 	const resolvedPrompt = typeof prompt === "function" ? prompt(analysisSession.mode) : prompt;
 	const promptWithAwareness = `${getAnalysisSessionAwarenessInstruction(analysisSession.mode)}\n\n${resolvedPrompt}`;
@@ -992,14 +751,6 @@ async function analyzeWithPi({
 			const childEnv = { ...process.env };
 			delete childEnv.PI_PACKAGE_DIR;
 
-			trace("analysis child spawn", {
-				backend: `${backend.provider}/${backend.model}${backend.thinkingLevel ? `:${backend.thinkingLevel}` : ""}`,
-				attachments: attachmentPaths.length,
-				sessionMode: analysisSession.mode,
-				setupMs: Date.now() - setupStarted,
-			});
-			const childStarted = Date.now();
-
 			const child = spawn("pi", args, {
 				stdio: ["ignore", "pipe", "pipe"],
 				env: childEnv,
@@ -1021,13 +772,6 @@ async function analyzeWithPi({
 			});
 
 			child.on("close", (code: number | null) => {
-				trace("analysis child close", {
-					code,
-					durationMs: Date.now() - childStarted,
-					stdoutBytes: stdout.length,
-					stderrBytes: stderr.length,
-					...(code !== 0 ? { stderr: stderr.slice(0, 500) } : {}),
-				});
 				if (code !== 0) {
 					reject(new Error(`pi subprocess failed (${code}): ${stderr}`));
 					return;
@@ -1777,7 +1521,7 @@ async function resolveInlineBashImageContent(
 			video: false,
 			pdf: false,
 			backend,
-			session: await getAnalysisSessionOptions({ ...ctx, backend }),
+			session: await getAnalysisSessionOptions(ctx),
 			signal,
 		});
 		return result.content;
@@ -1939,6 +1683,11 @@ export default function (pi: ExtensionAPI) {
 					return undefined;
 				}
 
+				const cachedSummary = analyzedMediaCache.get(absolutePath);
+				if (cachedSummary) {
+					return { content: [{ type: "text" as const, text: cachedSummary }], details: {} };
+				}
+
 				if (needsVisionProxy(ctx.model?.input) && explicitMediaAnalysisPaths.has(absolutePath)) {
 					const backend = await getMultiModalBackend();
 					const result = await analyzeMediaToolResult(absolutePath, {
@@ -1946,7 +1695,7 @@ export default function (pi: ExtensionAPI) {
 						video,
 						pdf,
 						backend,
-						session: await getAnalysisSessionOptions({ ...ctx, backend }),
+						session: await getAnalysisSessionOptions(ctx),
 					});
 					return { content: result.content, details: result.details };
 				}
@@ -1994,27 +1743,23 @@ export default function (pi: ExtensionAPI) {
 
 	let explicitMediaPathsForContext: string[] = [];
 	let explicitMediaAnalysisForContext: string | undefined;
+	const analyzedMediaCache = new Map<string, string>();
 
 	pi.on("turn_end", () => {
 		explicitMediaAnalysisPaths = new Set<string>();
 		explicitMediaPathsForContext = [];
 		explicitMediaAnalysisForContext = undefined;
+		analyzedMediaCache.clear();
 	});
 
 	pi.on("input", async (event, ctx) => {
-		const inputStarted = Date.now();
 		// Detect media paths from both @-prefixed paths and <file name="..."> tags.
 		// Pi converts @path to <file> before on("input") fires, so we need both.
 		const explicitMediaPaths = findExplicitMediaPaths(event.text);
 		explicitMediaPathsForContext = explicitMediaPaths;
 		explicitMediaAnalysisForContext = undefined;
 		explicitMediaAnalysisPaths = new Set(explicitMediaPaths.map((path) => resolveUserPath(ctx.cwd, path)));
-		trace("input media detected", {
-			paths: explicitMediaPaths.length,
-			images: event.images?.length ?? 0,
-			supportsNativeImages: supportsNativeImageInput(ctx.model?.input),
-			durationMs: Date.now() - inputStarted,
-		});
+
 		if (ctx.hasUI) {
 			attachmentIndicatorController.reset(ctx as AttachmentIndicatorCtx);
 		}
@@ -2076,7 +1821,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("context", async (event, ctx) => {
-		const contextStarted = Date.now();
 		const messages = structuredClone(event.messages).filter(
 			(message) => message.role !== "custom" || message.customType !== REFERENCED_IMAGES_MESSAGE_TYPE,
 		);
@@ -2089,11 +1833,7 @@ export default function (pi: ExtensionAPI) {
 				})
 			: explicitMediaPathsForContext;
 
-		trace("context media check", {
-			candidatePaths: explicitMediaPathsForContext.length,
-			analyzePaths: mediaPathsToAnalyze.length,
-			supportsNativeImages: supportsImages,
-		});
+
 
 		if (mediaPathsToAnalyze.length > 0) {
 			if (!explicitMediaAnalysisForContext) {
@@ -2101,16 +1841,18 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Analyzing ${mediaPathsToAnalyze.length} explicit @media reference(s)...`, "info");
 				}
 				const backend = await getMultiModalBackend();
-				const analysisStarted = Date.now();
 				explicitMediaAnalysisForContext = await analyzeExplicitMediaReferences(mediaPathsToAnalyze, {
 					cwd: ctx.cwd,
 					backend,
-					session: await getAnalysisSessionOptions({ ...ctx, backend }),
+					session: await getAnalysisSessionOptions(ctx),
 				});
-				trace("context analysis complete", {
-					durationMs: Date.now() - analysisStarted,
-					analysisBytes: explicitMediaAnalysisForContext.length,
-				});
+
+				// Cache each analyzed path so the read tool can return the summary
+				// without spawning another child pi process.
+				for (const path of mediaPathsToAnalyze) {
+					const absolutePath = resolveUserPath(ctx.cwd, path);
+					analyzedMediaCache.set(absolutePath, explicitMediaAnalysisForContext);
+				}
 			}
 
 			if (explicitMediaAnalysisForContext) {
@@ -2120,26 +1862,53 @@ export default function (pi: ExtensionAPI) {
 						continue;
 					}
 
+					// Strip @-prefix and <file> tags for analyzed media paths so the
+					// agent doesn't try to re-read the file after receiving the summary.
+					// Uses targeted string replacement per path (not a broad regex) to
+					// avoid stripping @ from non-media file references.
+					let text: string;
+					let textBlock: { text: string } | undefined;
+
 					if (typeof message.content === "string") {
-						message.content = `${message.content}\n\n${explicitMediaAnalysisForContext}`;
-						changed = true;
-						break;
+						text = message.content;
+					} else {
+						textBlock = message.content.find((block) => block.type === "text");
+						if (!textBlock) {
+							message.content = [{ type: "text", text: explicitMediaAnalysisForContext }, ...message.content];
+							changed = true;
+							break;
+						}
+						text = textBlock.text;
 					}
 
-					const textBlock = message.content.find((block) => block.type === "text");
-					if (textBlock) {
-						textBlock.text = `${textBlock.text}\n\n${explicitMediaAnalysisForContext}`;
-					} else {
-						message.content = [{ type: "text", text: explicitMediaAnalysisForContext }, ...message.content];
+					for (const mediaPath of mediaPathsToAnalyze) {
+						const absPath = resolveUserPath(ctx.cwd, mediaPath);
+						text = text.replaceAll(`@${mediaPath}`, mediaPath);
+						text = text.replaceAll(`@${absPath}`, absPath);
+						text = text.replaceAll(`<file name="${absPath}"></file>`, mediaPath);
+					}
+					const augmented = `${text}\n\n${explicitMediaAnalysisForContext}`;
+
+					if (typeof message.content === "string") {
+						message.content = augmented;
+					} else if (textBlock) {
+						textBlock.text = augmented;
 					}
 					changed = true;
 					break;
+				}
+
+				// Clear these paths from explicitMediaAnalysisPaths so the read tool
+				// intercept uses the cache instead of re-analyzing.
+				for (const path of mediaPathsToAnalyze) {
+					const absolutePath = resolveUserPath(ctx.cwd, path);
+					explicitMediaAnalysisPaths.delete(absolutePath);
 				}
 			}
 		}
 
 		if (!supportsImages) {
-			trace("context complete", { changed, durationMs: Date.now() - contextStarted });
+
 			return changed ? { messages } : undefined;
 		}
 
@@ -2165,7 +1934,7 @@ export default function (pi: ExtensionAPI) {
 		return changed ? { messages } : undefined;
 	});
 
-	// Override read to intercept image/video/PDF reads for non-vision models
+	// Override read to intercept @-prefixed media reads for text-only models.
 	if (!wrapExistingToolsEnabled()) {
 		pi.registerTool({
 			...localRead,
@@ -2188,20 +1957,27 @@ export default function (pi: ExtensionAPI) {
 					return localRead.execute(toolCallId, params, signal, onUpdate);
 				}
 
-				if (!explicitMediaAnalysisPaths.has(absolutePath)) {
-					return localRead.execute(toolCallId, params, signal, onUpdate);
+				// Return cached analysis if available (set by the context hook).
+				const cachedSummary = analyzedMediaCache.get(absolutePath);
+				if (cachedSummary) {
+					return { content: [{ type: "text" as const, text: cachedSummary }], details: {} };
 				}
 
-				const backend = await getMultiModalBackend();
-				return analyzeMediaToolResult(absolutePath, {
-					image,
-					video,
-					pdf,
-					backend,
-					session: await getAnalysisSessionOptions({ ...ctx, backend }),
-					signal,
-					onUpdate,
-				});
+				if (explicitMediaAnalysisPaths.has(absolutePath)) {
+					const backend = await getMultiModalBackend();
+					return analyzeMediaToolResult(absolutePath, {
+						image,
+						video,
+						pdf,
+						backend,
+						session: await getAnalysisSessionOptions(ctx),
+						signal,
+						onUpdate,
+					});
+				}
+
+				// Not an @-referenced media file. Pass through to normal read.
+				return localRead.execute(toolCallId, params, signal, onUpdate);
 			},
 		});
 	}

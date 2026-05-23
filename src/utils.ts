@@ -111,17 +111,6 @@ function readStringSetting(settings: unknown, path: readonly string[]): string |
 	return typeof current === "string" ? current : undefined;
 }
 
-function readNumberSetting(settings: unknown, path: readonly string[]): number | undefined {
-	let current: unknown = settings;
-	for (const key of path) {
-		if (current === null || typeof current !== "object" || !(key in current)) {
-			return undefined;
-		}
-		current = (current as Record<string, unknown>)[key];
-	}
-	return typeof current === "number" ? current : undefined;
-}
-
 export function readMultiModalBackendSetting(settings: unknown): MultiModalBackendConfig {
 	const provider = readStringSetting(settings, ["multiModal", "provider"]) ?? DEFAULT_MULTI_MODAL_BACKEND.provider;
 	const model = readStringSetting(settings, ["multiModal", "model"]) ?? DEFAULT_MULTI_MODAL_BACKEND.model;
@@ -132,11 +121,6 @@ export function readMultiModalBackendSetting(settings: unknown): MultiModalBacke
 export function readAnalysisSessionModeSetting(settings: unknown): AnalysisSessionMode {
 	const mode = readStringSetting(settings, ["multiModal", "analysisSession"]);
 	return isAnalysisSessionMode(mode) ? mode : DEFAULT_ANALYSIS_SESSION_MODE;
-}
-
-export function readReservedOutputTokensSetting(settings: unknown): number {
-	const value = readNumberSetting(settings, ["multiModal", "reservedOutputTokens"]);
-	return value ?? 10_000;
 }
 
 export function parseBashImageOutput(text: string): { parts: BashImageOutputPart[]; foundMarkers: boolean } {

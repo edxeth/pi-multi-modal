@@ -108,8 +108,7 @@ The command writes this shape to `~/.pi/agent/settings.json`:
     "provider": "nahcrof",
     "model": "kimi-k2.6-precision",
     "thinkingLevel": "high",
-    "analysisSession": "isolated",
-    "reservedOutputTokens": 10000
+    "analysisSession": "isolated"
   }
 }
 ```
@@ -123,30 +122,11 @@ The backend model must exist in your pi model registry and must support image in
 Media analysis runs in a short-lived backend pi process. `analysisSession` controls how much conversation that backend can see:
 
 - `"isolated"` starts the analyzer with no prior conversation. This is the default. It is best when you want the media summary to stand on its own.
-- `"fork"` gives the analyzer a trimmed copy of the current pi session. This is useful when the image only makes sense with earlier chat context, for example “compare this to the previous screenshot.”
+- `"fork"` gives the analyzer a copy of the current pi session via Pi's native `--fork` flag. This is useful when the image only makes sense with earlier chat context, for example “compare this to the previous screenshot.”
 
-Both modes are ephemeral. Isolated analysis uses `--no-session`. Forked analysis writes into a temporary session directory and deletes it after the analysis finishes. If pi cannot find the current session file, fork mode safely falls back to isolated mode.
+Both modes are ephemeral. Isolated analysis uses `--no-session`. Forked analysis uses `--fork` and Pi handles session forking internally. If pi cannot find the current session file, fork mode safely falls back to isolated mode.
 
 The analyzer is also told which mode it is in, so it knows whether it can rely on previous conversation or must only use the media and the analysis prompt.
-
-### Session trimming (fork mode)
-
-When `analysisSession` is `"fork"`, the extension reads the current session file and trims it to fit the analysis model’s context window before passing it to the child pi process. This prevents silent failures when the session file on disk is much larger than the parent’s active context (e.g. after many turns with custom entries from other extensions).
-If the session’s active context fits within the budget, no entries are dropped. If it exceeds the budget, the oldest entries are dropped first, preserving the most recent conversation.
-
-### `reservedOutputTokens`
-
-Controls how many tokens to reserve for the analysis model’s output when trimming forked sessions. Set in `~/.pi/agent/settings.json`:
-
-```json
-{
-  "multiModal": {
-    "reservedOutputTokens": 10000
-  }
-}
-```
-
-Lower values give the analysis model more room for input context but risk truncating its response. Higher values reserve more output space at the cost of less context from the parent session.
 
 ### Multiple assets
 
