@@ -1,5 +1,14 @@
 # pi-multi-modal
 
+## 🌐 **Join the Community**
+
+> [!NOTE]
+> **Building with AI doesn’t have to be a solo grind.**  
+> Join our Discord community to meet other people exploring the latest models, tools, workflows, and ideas: **https://discord.gg/whhrDtCrSS**
+>
+> We talk about what’s new, what’s useful, and what’s actually worth paying attention to in AI.  
+> *And if you want more than conversation,* members also get access to **heavily discounted AI products and services** — including deals on tools like **ChatGPT Plus** and more for just a few dollars.
+
 `pi-multi-modal` lets pi work with local images, videos, and PDFs without making you change how you talk to the agent.
 
 Point at a file with `@./path`, or emit an image from bash with `__PI_IMAGE__`. If the active model can see images, pi gets the image directly. If it cannot, this extension quietly asks a configured vision model to analyze the media and gives the active agent a clean text summary.
