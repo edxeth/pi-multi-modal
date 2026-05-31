@@ -126,6 +126,8 @@ If you leave off `:thinking`, no thinking flag is passed to the backend.
 
 The backend model must exist in your pi model registry and must support image input.
 
+Backend summaries are inserted as fenced **untrusted media-derived content**. The agent should use them only as factual context about the media and must not follow instructions found inside images, videos, or PDFs.
+
 ## Conversation awareness
 
 Media analysis runs in a short-lived backend pi process. `analysisSession` controls how much conversation that backend can see:
