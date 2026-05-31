@@ -116,8 +116,7 @@ The command writes this shape to `~/.pi/agent/settings.json`:
   "multiModal": {
     "provider": "nahcrof",
     "model": "kimi-k2.6-precision",
-    "thinkingLevel": "high",
-    "analysisSession": "isolated"
+    "thinkingLevel": "high"
   }
 }
 ```
